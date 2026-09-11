@@ -59,6 +59,8 @@ def _passive_summary(card: dict) -> str:
         return f"Passive {card['passive_cost']}: {card['passive_block']} ({total} vs {card['passive_condition_color']})"
     if effect == "reflect":
         return f"Passive {card['passive_cost']}: reflects damage"
+    if effect == "reflect_color":
+        return f"Passive {card['passive_cost']}: reflects vs {card['passive_condition_color']}"
     return f"Passive {card['passive_cost']}: blocks {card['passive_block']}"
 
 
@@ -151,14 +153,20 @@ def main():
     with open(CARDS_JSON) as f:
         cards = json.load(f)
 
+    skipped = 0
+    generated = 0
     for card in cards:
+        if card.get("custom_art"):
+            skipped += 1
+            continue
         generate_card_image(card).save(CARDS_DIR / f"{card['id']}.png")
+        generated += 1
 
     generate_blank_card().save(CARDS_DIR / "_blank.png")
     generate_hex_background().save(BOARD_DIR / "hex_background.png")
 
-    print(f"Generated {len(cards)} card images, 1 blank placeholder, and the board background "
-          f"in {CARDS_DIR} and {BOARD_DIR}.")
+    print(f"Generated {generated} placeholder card images (skipped {skipped} with custom_art), "
+          f"1 blank placeholder, and the board background in {CARDS_DIR} and {BOARD_DIR}.")
 
 
 if __name__ == "__main__":

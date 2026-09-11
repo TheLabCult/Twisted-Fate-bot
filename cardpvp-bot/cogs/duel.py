@@ -25,14 +25,16 @@ Requires the bot to have the "Manage Channels" permission in the server.
 
 import asyncio
 import io
+import json
 import discord
 import uuid
+from pathlib import Path
 from typing import Optional
 from discord import app_commands
 from discord.ext import commands
 
 from game.cards import load_card_pool
-from game.engine import DECK_SIZE, MAX_MANA, STARTING_HP, Card, MatchManager, PassiveEffect
+from game.engine import DECK_SIZE, MAX_MANA, STARTING_HP, ActiveCondition, ActiveEffect, Card, MatchManager, PassiveEffect
 from render.board import BattleRenderState, PlayerRenderState, render_battle_image
 
 CHALLENGE_TIMEOUT_SECONDS = 120
@@ -45,6 +47,8 @@ CATEGORIES = ["Red", "Blue", "Green", "Yellow", "Purple"]
 CATEGORY_EMOJI = {"Red": "🔴", "Blue": "🔵", "Green": "🟢", "Yellow": "🟡", "Purple": "🟣"}
 DUEL_CATEGORY_NAME = "Duels"
 
+REGISTRY_PATH = Path(__file__).parent.parent / "runtime" / "active_duel_channels.json"
+
 
 def describe_passive_compact(card: Card) -> str:
     """Short form for the deckbuilder, which has limited description space."""
@@ -55,6 +59,8 @@ def describe_passive_compact(card: Card) -> str:
         return f"🛡{card.passive_cost} {card.passive_block} ({total} vs {card.passive_condition_color})"
     if card.passive_effect == PassiveEffect.REFLECT:
         return f"🛡{card.passive_cost} reflect dmg"
+    if card.passive_effect == PassiveEffect.REFLECT_COLOR:
+        return f"🛡{card.passive_cost} reflect vs {card.passive_condition_color}"
     return f"🛡{card.passive_cost}/{card.passive_block}"
 
 
@@ -67,12 +73,88 @@ def describe_passive_full(card: Card) -> str:
         return f"Cost {card.passive_cost} • blocks {card.passive_block} (blocks {total} vs {card.passive_condition_color})"
     if card.passive_effect == PassiveEffect.REFLECT:
         return f"Cost {card.passive_cost} • reflects all damage back at the attacker"
+    if card.passive_effect == PassiveEffect.REFLECT_COLOR:
+        return f"Cost {card.passive_cost} • reflects vs {card.passive_condition_color} (else blocks {card.passive_block})"
     return f"Cost {card.passive_cost} • blocks {card.passive_block}"
+
+
+def _active_condition_text(card: Card) -> str:
+    if card.active_condition == ActiveCondition.LOWER_HP:
+        return "if lower HP"
+    if card.active_condition == ActiveCondition.LAST_DISCARD_COLOR:
+        return f"if last discard is {card.active_condition_color}"
+    if card.active_condition == ActiveCondition.HAND_ALL_COLOR:
+        return f"if hand is all {card.active_condition_color}"
+    return ""
+
+
+def describe_active_compact(card: Card) -> str:
+    """Short form for the deckbuilder."""
+    if card.active_effect == ActiveEffect.SWAP_MANA:
+        return f"⚔{card.active_cost} swap mana"
+    if card.active_effect == ActiveEffect.SWAP_HP:
+        return f"⚔{card.active_cost} swap HP"
+    if card.active_effect == ActiveEffect.HEAL_IF_COLOR:
+        return f"⚔{card.active_cost} heal {card.active_heal_amount} ({_active_condition_text(card)})"
+    if card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
+        return f"⚔{card.active_cost} +{card.active_mana_gain} mana ({_active_condition_text(card)})"
+
+    base = f"⚔{card.active_cost} {card.active_damage}dmg"
+    if card.active_condition != ActiveCondition.NONE and card.active_bonus_damage:
+        base += f" (+{card.active_bonus_damage} {_active_condition_text(card)})"
+    return base
+
+
+def describe_active_full(card: Card) -> str:
+    """Longer form for the in-match Attack menu."""
+    if card.active_effect == ActiveEffect.SWAP_MANA:
+        return f"Cost {card.active_cost} • swaps your mana with your opponent's"
+    if card.active_effect == ActiveEffect.SWAP_HP:
+        return f"Cost {card.active_cost} • swaps your HP with your opponent's"
+    if card.active_effect == ActiveEffect.HEAL_IF_COLOR:
+        return f"Cost {card.active_cost} • heal {card.active_heal_amount} HP ({_active_condition_text(card)})"
+    if card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
+        return f"Cost {card.active_cost} • gain {card.active_mana_gain} mana ({_active_condition_text(card)})"
+
+    base = f"Cost {card.active_cost} • {card.active_damage} dmg"
+    if card.active_condition != ActiveCondition.NONE and card.active_bonus_damage:
+        base += f" (+{card.active_bonus_damage} {_active_condition_text(card)})"
+    return base
 
 
 # ---------------------------------------------------------------------------
 # Channel management
 # ---------------------------------------------------------------------------
+
+def _load_registry() -> set[int]:
+    try:
+        with open(REGISTRY_PATH) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def _save_registry(channel_ids: set[int]) -> None:
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(REGISTRY_PATH, "w") as f:
+        json.dump(list(channel_ids), f)
+
+
+def _register_channel_id(channel_id: int) -> None:
+    """Marks a duel channel as 'live' on disk. Read back at startup to clean up
+    anything left behind by a shutdown that didn't run cleanly (crash, forced
+    kill, or -- notoriously on Windows -- Ctrl+C not letting async cleanup
+    finish before the process dies)."""
+    ids = _load_registry()
+    ids.add(channel_id)
+    _save_registry(ids)
+
+
+def _unregister_channel_id(channel_id: int) -> None:
+    ids = _load_registry()
+    ids.discard(channel_id)
+    _save_registry(ids)
+
 
 def _slugify_channel_name(a: discord.Member, b: discord.Member) -> str:
     def clean(name: str) -> str:
@@ -110,6 +192,8 @@ async def schedule_channel_deletion(channel: discord.TextChannel, delay: int):
         await channel.delete(reason="Duel finished")
     except (discord.NotFound, discord.Forbidden):
         pass  # already gone, or bot lost permission -- nothing more we can do
+    finally:
+        _unregister_channel_id(channel.id)
 
 
 # ---------------------------------------------------------------------------
@@ -140,11 +224,13 @@ async def render_board_file(match, members: dict[int, discord.Member], avatar_ca
     async def to_render_state(uid: int) -> PlayerRenderState:
         p = match.players[uid]
         avatar_bytes = await get_avatar_bytes(members[uid], avatar_cache)
+        last_discard = p.discard[-1] if p.discard else None
         return PlayerRenderState(
             name=members[uid].display_name,
             hp=p.hp, max_hp=STARTING_HP,
             mana=p.mana, max_mana=MAX_MANA,
             hand_count=len(p.hand), deck_count=len(p.deck), discard_count=len(p.discard),
+            last_discard_card_id=(last_discard.template_id or last_discard.id) if last_discard else None,
             avatar_bytes=avatar_bytes,
         )
 
@@ -171,7 +257,7 @@ async def render_board_file(match, members: dict[int, discord.Member], avatar_ca
         played_card_caption=played_card_caption,
         winner_name=winner_name,
     )
-    png_bytes = render_battle_image(state)
+    png_bytes = await asyncio.to_thread(render_battle_image, state)
     return discord.File(io.BytesIO(png_bytes), filename="battle.png")
 
 
@@ -274,7 +360,7 @@ class DeckBuilderView(discord.ui.View):
             options=[
                 discord.SelectOption(
                     label=c.name,
-                    description=f"⚔{c.active_cost}/{c.active_damage}  {describe_passive_compact(c)}",
+                    description=f"{describe_active_compact(c)}  {describe_passive_compact(c)}",
                     value=c.id,
                     default=c.id in self.picked,
                 )
@@ -462,7 +548,7 @@ class HandSelectView(discord.ui.View):
         if mode == "attack":
             hand = match.players[match.active_player_id].hand
             options = [
-                discord.SelectOption(label=c.name, description=f"Cost {c.active_cost} • {c.active_damage} dmg", value=c.id)
+                discord.SelectOption(label=c.name, description=describe_active_full(c), value=c.id)
                 for c in hand
             ]
         else:
@@ -634,10 +720,11 @@ class Duel(commands.Cog):
 
     async def cleanup_all_channels(self):
         """
-        Called by the bot at shutdown so duel channels don't get orphaned
-        just because the process stopped before a scheduled deletion fired
-        (scheduled deletions live as asyncio tasks tied to this process --
-        they don't survive a restart).
+        Best-effort cleanup for a CLEAN shutdown (one where close() actually
+        gets to run) -- deletes everything currently tracked in memory.
+        This is a fast path, not the safety net: see sweep_orphaned_channels
+        for what handles crashes, forced kills, or a Ctrl+C that doesn't let
+        this coroutine finish (a known flaky spot on Windows + asyncio).
         """
         channels_to_delete = list(self.channels.values())
         channels_to_delete += [session.channel for session in self.drafts.values()]
@@ -647,6 +734,33 @@ class Duel(commands.Cog):
                 await channel.delete(reason="Bot shutting down")
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass  # already gone, or we lost permission -- nothing more we can do
+            finally:
+                _unregister_channel_id(channel.id)
+
+    async def sweep_orphaned_channels(self):
+        """
+        Called once on startup (after the bot is connected). Reads the
+        on-disk registry of channels that were live last time the process
+        ran and deletes any that are still sitting there -- this is what
+        actually fixes channels surviving an unclean shutdown, since it
+        doesn't depend on any shutdown code having run at all.
+        """
+        orphaned_ids = _load_registry()
+        if not orphaned_ids:
+            return
+
+        log_deleted = 0
+        for channel_id in orphaned_ids:
+            try:
+                channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+                await channel.delete(reason="Cleaning up duel channel orphaned by a previous shutdown")
+                log_deleted += 1
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass  # already gone, or we lost permission -- nothing more we can do
+
+        _save_registry(set())  # registry is fully reconciled now, regardless of individual failures
+        if log_deleted:
+            print(f"[duel] Swept {log_deleted} orphaned duel channel(s) from a previous session.")
 
     @app_commands.command(name="duel", description="Challenge another player to a card duel in a private channel.")
     async def duel(self, interaction: discord.Interaction, opponent: discord.Member):
@@ -676,6 +790,7 @@ class Duel(commands.Cog):
 
         category = await get_or_create_duel_category(interaction.guild)
         channel = await create_duel_channel(interaction.guild, category, interaction.user, opponent)
+        _register_channel_id(channel.id)
 
         draft_id = str(uuid.uuid4())
         challenge_message = await channel.send(

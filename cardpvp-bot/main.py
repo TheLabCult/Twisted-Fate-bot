@@ -21,6 +21,7 @@ INTENTS.message_content = False  # we don't need raw message reading; slash comm
 class CardPvPBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=INTENTS)
+        self._swept_orphans = False
 
     async def setup_hook(self):
         # Load all cogs
@@ -41,6 +42,14 @@ class CardPvPBot(commands.Bot):
 
     async def on_ready(self):
         log.info(f"Logged in as {self.user} (ID: {self.user.id})")
+
+        # Only once per process -- on_ready can re-fire after a gateway
+        # reconnect, and we don't want to re-sweep every time.
+        if not self._swept_orphans:
+            self._swept_orphans = True
+            duel_cog = self.get_cog("Duel")
+            if duel_cog:
+                await duel_cog.sweep_orphaned_channels()
 
     async def close(self):
         # Run this BEFORE super().close() disconnects -- channel.delete()

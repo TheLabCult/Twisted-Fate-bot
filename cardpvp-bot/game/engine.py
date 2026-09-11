@@ -47,7 +47,34 @@ class PassiveEffect(Enum):
     BLOCK_BONUS_COLOR = "block_bonus_color"  # blocks passive_block normally, but blocks
                                               # passive_block + passive_bonus_block IF the attacking
                                               # card's color == condition_color
-    REFLECT = "reflect"                      # redirect the full incoming damage back onto the attacker instead
+    REFLECT = "reflect"                      # redirect the full incoming damage back onto the attacker instead,
+                                              # unconditionally
+    REFLECT_COLOR = "reflect_color"          # redirect the full incoming damage back onto the attacker IF the
+                                              # attacking card's color == condition_color; otherwise falls back
+                                              # to a normal BLOCK using passive_block
+
+
+class ActiveCondition(Enum):
+    NONE = "none"
+    LOWER_HP = "lower_hp"                        # bonus if the attacker currently has less HP than the defender
+    LAST_DISCARD_COLOR = "last_discard_color"    # bonus if the attacker's own most recent discard matches
+                                                  # active_condition_color
+    HAND_ALL_COLOR = "hand_all_color"            # bonus if every card in the attacker's hand (including the
+                                                  # one being played) matches active_condition_color
+
+
+class ActiveEffect(Enum):
+    DAMAGE = "damage"                            # the default: deals active_damage (+ conditional bonus per
+                                                  # ActiveCondition) to the opponent, who gets a reaction window
+    SWAP_MANA = "swap_mana"                      # unconditionally swaps current mana pools with the opponent
+    SWAP_HP = "swap_hp"                          # unconditionally swaps current HP pools with the opponent
+    HEAL_IF_COLOR = "heal_if_color"              # heals active_heal_amount to self IF active_condition is met
+                                                  # (only LAST_DISCARD_COLOR makes sense here); otherwise no effect
+    GAIN_MANA_IF_COLOR = "gain_mana_if_color"    # gains active_mana_gain mana to self IF active_condition is met;
+                                                  # otherwise no effect
+    # None of these target the opponent with damage, so playing one does NOT
+    # open a reaction window -- the turn resolves and passes immediately,
+    # the same way a Skip does.
 
 
 @dataclass
@@ -60,8 +87,14 @@ class Card:
     passive_block: int
     color: str = ""
     passive_effect: PassiveEffect = PassiveEffect.BLOCK
-    passive_condition_color: str = ""  # meaningful for NEGATE_COLOR and BLOCK_BONUS_COLOR
+    passive_condition_color: str = ""  # meaningful for NEGATE_COLOR, BLOCK_BONUS_COLOR, and REFLECT_COLOR
     passive_bonus_block: int = 0       # meaningful for BLOCK_BONUS_COLOR only
+    active_condition: ActiveCondition = ActiveCondition.NONE
+    active_condition_color: str = ""   # meaningful for LAST_DISCARD_COLOR and HAND_ALL_COLOR
+    active_bonus_damage: int = 0       # extra damage dealt if active_condition is met (DAMAGE effect only)
+    active_effect: ActiveEffect = ActiveEffect.DAMAGE
+    active_heal_amount: int = 0        # meaningful for HEAL_IF_COLOR only
+    active_mana_gain: int = 0          # meaningful for GAIN_MANA_IF_COLOR only
     template_id: str = ""              # stable id for asset lookup (e.g. "fireball") -- unlike
                                         # `id`, this survives clone() so a played card's art can
                                         # still be found even though its instance id is a fresh uuid
@@ -81,6 +114,12 @@ class Card:
             passive_effect=self.passive_effect,
             passive_condition_color=self.passive_condition_color,
             passive_bonus_block=self.passive_bonus_block,
+            active_condition=self.active_condition,
+            active_condition_color=self.active_condition_color,
+            active_bonus_damage=self.active_bonus_damage,
+            active_effect=self.active_effect,
+            active_heal_amount=self.active_heal_amount,
+            active_mana_gain=self.active_mana_gain,
             template_id=self.template_id or self.id,
             text=self.text,
         )
@@ -191,18 +230,36 @@ class Match:
         if card.active_cost > attacker.mana:
             return ActionResult(False, f"Not enough mana ({attacker.mana}/{card.active_cost} needed).")
 
+        defender_id = self._opponent_of(attacker_id)
+        defender = self.players[defender_id]
+
+        if card.active_effect != ActiveEffect.DAMAGE:
+            return self._play_utility_active(attacker, defender, card)
+
+        # Conditional bonus damage is checked against state as it stood at
+        # the moment of playing -- e.g. "hand is all Red" includes this
+        # card itself, and is checked BEFORE it's removed from hand.
+        bonus_triggered = False
+        if card.active_condition == ActiveCondition.LOWER_HP:
+            bonus_triggered = attacker.hp < defender.hp
+        elif card.active_condition == ActiveCondition.LAST_DISCARD_COLOR:
+            bonus_triggered = bool(attacker.discard) and attacker.discard[-1].color == card.active_condition_color
+        elif card.active_condition == ActiveCondition.HAND_ALL_COLOR:
+            bonus_triggered = all(c.color == card.active_condition_color for c in attacker.hand)
+
+        damage = card.active_damage + (card.active_bonus_damage if bonus_triggered else 0)
+
         attacker.mana -= card.active_cost
         attacker.hand.remove(card)
         attacker.discard.append(card)
 
-        defender_id = self._opponent_of(attacker_id)
         self.awaiting_reaction = PendingReaction(
             attacker_id=attacker_id,
             defender_id=defender_id,
             card_name=card.name,
             template_id=card.template_id or card.id,
             color=card.color,
-            damage=card.active_damage,
+            damage=damage,
         )
         self.last_played = LastPlayed(
             player_id=attacker_id,
@@ -211,11 +268,70 @@ class Match:
             color=card.color,
             role="active",
         )
+        bonus_note = " (bonus triggered!)" if bonus_triggered and card.active_bonus_damage else ""
         return ActionResult(
             True,
-            f"<@{attacker_id}> attacks with **{card.name}** for {card.active_damage}. "
+            f"<@{attacker_id}> attacks with **{card.name}** for {damage}{bonus_note}. "
             f"<@{defender_id}> may react.",
         )
+
+    def _play_utility_active(self, attacker: PlayerState, defender: PlayerState, card: Card) -> ActionResult:
+        """
+        Handles non-damage active effects (mana/HP swap, conditional heal,
+        conditional mana gain). None of these target the opponent with
+        damage, so there's nothing to react to -- the turn just resolves
+        and passes immediately, same as skip().
+        """
+        # LAST_DISCARD_COLOR is checked against state BEFORE this card joins
+        # the discard pile (otherwise it would always match itself).
+        condition_met = (
+            card.active_condition == ActiveCondition.LAST_DISCARD_COLOR
+            and bool(attacker.discard)
+            and attacker.discard[-1].color == card.active_condition_color
+        )
+
+        attacker.mana -= card.active_cost
+        attacker.hand.remove(card)
+        attacker.discard.append(card)
+        self.last_played = LastPlayed(
+            player_id=attacker.user_id,
+            card_name=card.name,
+            template_id=card.template_id or card.id,
+            color=card.color,
+            role="active",
+        )
+
+        if card.active_effect == ActiveEffect.SWAP_MANA:
+            attacker.mana, defender.mana = defender.mana, attacker.mana
+            message = (
+                f"<@{attacker.user_id}> plays **{card.name}**, swapping mana with <@{defender.user_id}>! "
+                f"Now {attacker.mana}/{MAX_MANA} vs {defender.mana}/{MAX_MANA}."
+            )
+        elif card.active_effect == ActiveEffect.SWAP_HP:
+            # Safe without a fresh defeat-check: both values were already
+            # positive (a match ends the instant either hits 0), so swapping
+            # two positive numbers can't newly create a <=0 HP state.
+            attacker.hp, defender.hp = defender.hp, attacker.hp
+            message = (
+                f"<@{attacker.user_id}> plays **{card.name}**, swapping HP with <@{defender.user_id}>! "
+                f"Now {attacker.hp} HP vs {defender.hp} HP."
+            )
+        elif card.active_effect == ActiveEffect.HEAL_IF_COLOR:
+            if condition_met:
+                attacker.hp = min(attacker.hp + card.active_heal_amount, STARTING_HP)
+                message = f"<@{attacker.user_id}> plays **{card.name}**, healing to {attacker.hp} HP!"
+            else:
+                message = f"<@{attacker.user_id}> plays **{card.name}**, but the heal condition wasn't met."
+        elif card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
+            if condition_met:
+                attacker.gain_mana(card.active_mana_gain)
+                message = f"<@{attacker.user_id}> plays **{card.name}**, gaining mana ({attacker.mana}/{MAX_MANA})!"
+            else:
+                message = f"<@{attacker.user_id}> plays **{card.name}**, but the mana condition wasn't met."
+        else:
+            message = f"<@{attacker.user_id}> plays **{card.name}**."
+
+        return self._end_turn(message)
 
     def skip(self, user_id: int) -> ActionResult:
         if self.phase != GamePhase.IN_PROGRESS:
@@ -284,9 +400,16 @@ class Match:
                     f"<@{defender_id}> reflects **{pending.card_name}** with **{card.name}** — "
                     f"<@{pending.attacker_id}> takes {damage_to_attacker} instead!"
                 )
+            elif card.passive_effect == PassiveEffect.REFLECT_COLOR and pending.color == card.passive_condition_color:
+                damage_to_attacker = damage_to_defender
+                damage_to_defender = 0
+                resolution = (
+                    f"<@{defender_id}> reflects **{pending.card_name}** with **{card.name}** "
+                    f"(vs {pending.color}!) — <@{pending.attacker_id}> takes {damage_to_attacker} instead!"
+                )
             else:
-                # Default BLOCK behavior -- also the fallback for a NEGATE_COLOR
-                # card used against the "wrong" color.
+                # Default BLOCK behavior -- also the fallback for a NEGATE_COLOR or
+                # REFLECT_COLOR card used against the "wrong" color.
                 damage_to_defender = max(0, damage_to_defender - card.passive_block)
                 resolution = f"<@{defender_id}> blocks with **{card.name}** — {damage_to_defender} damage gets through."
         else:

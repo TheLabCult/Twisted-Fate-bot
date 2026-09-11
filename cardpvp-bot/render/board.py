@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
 
 ROOT = Path(__file__).parent.parent
 BACKGROUND_PATH = ROOT / "assets" / "board" / "hex_background.png"
@@ -60,96 +60,150 @@ def _outlined_text(draw: ImageDraw.ImageDraw, cx: float, cy: float, text: str, f
     draw.text((x, y), text, font=font, fill=fill)
 
 
-def _heart_points(w: float, h: float, margin: float = 6) -> list[tuple[float, float]]:
-    """Samples a classic parametric heart curve and fits it into a w x h box."""
-    n = 100
-    raw = []
-    for i in range(n):
-        t = 2 * math.pi * i / n
-        x = 16 * math.sin(t) ** 3
-        y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
-        raw.append((x, y))
-    xs, ys = [p[0] for p in raw], [p[1] for p in raw]
-    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
-    scale = min((w - 2 * margin) / (maxx - minx), (h - 2 * margin) / (maxy - miny))
-    return [
-        (margin + (x - minx) * scale, margin + (maxy - y) * scale)  # flip y: image coords grow downward
-        for x, y in raw
-    ]
+SS = 4  # supersample factor for smooth anti-aliased edges on the small HP/Mana icons
 
 
 def _render_heart_icon(fraction: float, size: tuple[int, int]) -> Image.Image:
-    """A glass/glossy heart, empty (grey-blue) at the top and filled with red liquid from the
-    bottom up according to `fraction` (0..1) -- used for the HP indicator."""
+    """A chubby, glossy heart (two circular lobes + a kite-shaped bottom), grey-blue when
+    empty and filling with red liquid from the bottom up according to `fraction` (0..1) --
+    matches the reference "glass heart" game-icon style. Used for the HP indicator."""
     w, h = size
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    pts = _heart_points(w, h)
+    W, H = w * SS, h * SS
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
-    draw.polygon(pts, fill=(150, 170, 195, 255))
+    r = W * 0.30
+    cy_lobe = H * 0.34
+    cx1, cx2 = W * 0.32, W * 0.68
 
-    mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).polygon(pts, fill=255)
+    def heart_shape(d, fill):
+        d.ellipse([cx1 - r, cy_lobe - r, cx1 + r, cy_lobe + r], fill=fill)
+        d.ellipse([cx2 - r, cy_lobe - r, cx2 + r, cy_lobe + r], fill=fill)
+        d.polygon([
+            (W * 0.5, H * 0.24),   # top point tucks into the valley between the lobes
+            (W * 0.97, H * 0.40),  # right point reaches the right lobe's outer edge
+            (W * 0.5, H * 0.94),   # bottom tip
+            (W * 0.03, H * 0.40),  # left point reaches the left lobe's outer edge
+        ], fill=fill)
 
-    ys = [p[1] for p in pts]
-    top, bottom = min(ys), max(ys)
-    fill_h = (bottom - top) * max(0.0, min(1.0, fraction))
-    fill_top = bottom - fill_h
+    # unified silhouette mask -- single source of truth, so there are no seams
+    # where the two circles and the wedge meet (drawing separate outlines per
+    # shape instead causes visible line artifacts at the overlaps).
+    mask = Image.new("L", (W, H), 0)
+    heart_shape(ImageDraw.Draw(mask), 255)
 
-    liquid_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shadow_layer.paste((0, 0, 0, 150), (0, int(H * 0.06)), mask)
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SS * 2.2))
+    img.alpha_composite(shadow_layer)
+
+    base_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    base_layer.paste((150, 168, 190, 255), (0, 0), mask)
+    img.alpha_composite(base_layer)
+
+    top_y, bottom_y = cy_lobe - r, H * 0.94
+    fill_h = (bottom_y - top_y) * max(0.0, min(1.0, fraction))
+    fill_top = bottom_y - fill_h
+    liquid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     if fill_h > 0:
-        ImageDraw.Draw(liquid_layer).rectangle([0, fill_top, w, h], fill=(222, 55, 65, 255))
-    liquid_layer.putalpha(ImageChops.multiply(liquid_layer.split()[3], mask))
-    img.alpha_composite(liquid_layer)
+        ld = ImageDraw.Draw(liquid)
+        ld.rectangle([0, fill_top, W, H], fill=(210, 35, 48, 255))
+        ld.rectangle([0, fill_top, W, fill_top + SS * 1.5], fill=(150, 20, 34, 255))  # seam shading
+    liquid.putalpha(ImageChops.multiply(liquid.split()[3], mask))
+    img.alpha_composite(liquid)
 
-    draw.polygon(pts, outline=(255, 255, 255, 255), width=3)
-    draw.ellipse([w * 0.20, h * 0.16, w * 0.42, h * 0.36], fill=(255, 255, 255, 110))
-    draw.ellipse([w * 0.56, h * 0.14, w * 0.70, h * 0.30], fill=(255, 255, 255, 85))
-    return img
+    # outline derived by eroding the SAME mask -- guarantees a clean, seamless ring
+    eroded = mask.filter(ImageFilter.MinFilter(int(SS * 3.2) * 2 + 1))
+    ring = ImageChops.subtract(mask, eroded)
+    img.paste((255, 255, 255, 255), (0, 0), ring)
+
+    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(hl)
+    hd.ellipse([cx1 - r * 0.55, cy_lobe - r * 0.75, cx1 + r * 0.15, cy_lobe - r * 0.05], fill=(255, 255, 255, 200))
+    hd.ellipse([cx2 - r * 0.55, cy_lobe - r * 0.75, cx2 + r * 0.15, cy_lobe - r * 0.05], fill=(255, 255, 255, 160))
+    img.alpha_composite(hl)
+
+    return img.resize((w, h), Image.LANCZOS)
 
 
 def _render_potion_icon(fraction: float, size: tuple[int, int]) -> Image.Image:
-    """A glass potion bottle (cork + neck + round bulb), filled with blue liquid from the
-    bottom up according to `fraction` (0..1) -- used for the Mana indicator."""
+    """A glossy glass potion bottle -- round bulb, narrow neck with a rim highlight, and a
+    textured cork -- filling with blue liquid from the bottom up according to `fraction`
+    (0..1). Matches the reference game-icon style. Used for the Mana indicator."""
     w, h = size
-    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+    W, H = w * SS, h * SS
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
 
-    cork_w, cork_h = w * 0.27, h * 0.13
-    neck_w, neck_h = w * 0.29, h * 0.15
-    bulb_w, bulb_h = w * 0.78, h * 0.52
+    bulb_r = W * 0.40
+    bulb_cx, bulb_cy = W * 0.5, H * 0.62
+    neck_w, neck_h = W * 0.30, H * 0.16
+    neck_top = bulb_cy - bulb_r - neck_h * 0.55
+    cork_w, cork_h = W * 0.36, H * 0.16
+    cork_top = neck_top - cork_h * 0.65
 
-    cork_box = [(w - cork_w) / 2, 2, (w + cork_w) / 2, 2 + cork_h]
-    neck_box = [(w - neck_w) / 2, cork_box[3] - 2, (w + neck_w) / 2, cork_box[3] - 2 + neck_h]
-    bulb_box = [(w - bulb_w) / 2, neck_box[3] - 6, (w + bulb_w) / 2, neck_box[3] - 6 + bulb_h]
+    def bottle_shape(d, fill):
+        d.rounded_rectangle(
+            [bulb_cx - neck_w / 2, neck_top, bulb_cx + neck_w / 2, neck_top + neck_h + bulb_r * 0.3],
+            radius=neck_w * 0.15, fill=fill,
+        )
+        d.ellipse([bulb_cx - bulb_r, bulb_cy - bulb_r, bulb_cx + bulb_r, bulb_cy + bulb_r], fill=fill)
 
-    glass_color = (160, 185, 205, 255)
-    draw.rounded_rectangle(neck_box, radius=4, fill=glass_color)
-    draw.ellipse(bulb_box, fill=glass_color)
+    mask = Image.new("L", (W, H), 0)
+    bottle_shape(ImageDraw.Draw(mask), 255)
 
-    mask = Image.new("L", (w, h), 0)
-    mdraw = ImageDraw.Draw(mask)
-    mdraw.rounded_rectangle(neck_box, radius=4, fill=255)
-    mdraw.ellipse(bulb_box, fill=255)
+    shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shadow_layer.paste((0, 0, 0, 150), (0, int(H * 0.04)), mask)
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SS * 2.2))
+    img.alpha_composite(shadow_layer)
 
-    top_overall, bottom_overall = neck_box[1], bulb_box[3]
-    fill_h = (bottom_overall - top_overall) * max(0.0, min(1.0, fraction))
-    fill_top = bottom_overall - fill_h
+    base_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    base_layer.paste((160, 185, 208, 255), (0, 0), mask)
+    img.alpha_composite(base_layer)
 
-    liquid_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    top_y, bottom_y = neck_top, bulb_cy + bulb_r
+    fill_h = (bottom_y - top_y) * max(0.0, min(1.0, fraction))
+    fill_top = bottom_y - fill_h
+    liquid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     if fill_h > 0:
-        ImageDraw.Draw(liquid_layer).rectangle([0, fill_top, w, h], fill=(55, 165, 230, 255))
-    liquid_layer.putalpha(ImageChops.multiply(liquid_layer.split()[3], mask))
-    img.alpha_composite(liquid_layer)
+        ld = ImageDraw.Draw(liquid)
+        ld.rectangle([0, fill_top, W, H], fill=(50, 160, 225, 255))
+        # meniscus -- a curved highlight arc right at the liquid surface
+        ld.ellipse([bulb_cx - bulb_r * 0.85, fill_top - H * 0.02, bulb_cx + bulb_r * 0.85, fill_top + H * 0.05],
+                   fill=(90, 190, 240, 255))
+    liquid.putalpha(ImageChops.multiply(liquid.split()[3], mask))
+    img.alpha_composite(liquid)
 
-    draw.rounded_rectangle(neck_box, radius=4, outline=(255, 255, 255, 255), width=2)
-    draw.ellipse(bulb_box, outline=(255, 255, 255, 255), width=3)
-    draw.rounded_rectangle(cork_box, radius=3, fill=(155, 115, 65, 255), outline=(95, 68, 38, 255), width=2)
+    eroded = mask.filter(ImageFilter.MinFilter(int(SS * 2.8) * 2 + 1))
+    ring = ImageChops.subtract(mask, eroded)
+    img.paste((255, 255, 255, 255), (0, 0), ring)
 
-    hl_box = [bulb_box[0] + bulb_w * 0.16, bulb_box[1] + bulb_h * 0.14,
-              bulb_box[0] + bulb_w * 0.38, bulb_box[1] + bulb_h * 0.42]
-    draw.ellipse(hl_box, fill=(255, 255, 255, 110))
-    return img
+    draw = ImageDraw.Draw(img)
+    rim_y = neck_top + neck_h * 0.35
+    draw.line([(bulb_cx - neck_w / 2 + SS, rim_y), (bulb_cx + neck_w / 2 - SS, rim_y)],
+              fill=(230, 240, 250, 200), width=int(SS * 1.2))
+
+    cork_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(cork_layer)
+    cd.ellipse([bulb_cx - cork_w / 2, cork_top, bulb_cx + cork_w / 2, cork_top + cork_h * 0.7],
+               fill=(178, 138, 88, 255))
+    cd.rounded_rectangle(
+        [bulb_cx - cork_w * 0.4, cork_top + cork_h * 0.35, bulb_cx + cork_w * 0.4, cork_top + cork_h * 1.3],
+        radius=cork_w * 0.15, fill=(178, 138, 88, 255),
+    )
+    cd.ellipse([bulb_cx - cork_w * 0.15, cork_top + cork_h * 0.15, bulb_cx + cork_w * 0.05, cork_top + cork_h * 0.4],
+               fill=(140, 105, 65, 255))  # texture dot
+    img.alpha_composite(cork_layer)
+    draw.rounded_rectangle(
+        [bulb_cx - cork_w * 0.42, cork_top - SS, bulb_cx + cork_w * 0.42, cork_top + cork_h * 1.3],
+        radius=cork_w * 0.15, outline=(110, 80, 45, 255), width=int(SS * 0.8),
+    )
+
+    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(hl)
+    hd.ellipse([bulb_cx - bulb_r * 0.65, bulb_cy - bulb_r * 0.65, bulb_cx - bulb_r * 0.05, bulb_cy - bulb_r * 0.05],
+               fill=(255, 255, 255, 170))
+    img.alpha_composite(hl)
+
+    return img.resize((w, h), Image.LANCZOS)
 
 
 def _load_background() -> Image.Image:
@@ -173,6 +227,7 @@ class PlayerRenderState:
     hand_count: int
     deck_count: int
     discard_count: int
+    last_discard_card_id: Optional[str] = None  # template_id of the top of THEIR OWN discard pile
     avatar_bytes: Optional[bytes] = None  # raw image bytes (their Discord avatar); None -> placeholder circle
 
 
@@ -228,34 +283,45 @@ def _draw_player_side(img: Image.Image, draw: ImageDraw.ImageDraw, player: Playe
 
     _centered(draw, pfp_cx, pfp_cy + pfp_r + 8, player.name, _font(15), TEXT_COLOR)
 
-    icon_x = pfp_cx + (95 if is_left else -95)
+    icon_x = pfp_cx + (100 if is_left else -100)
 
-    heart_size = (68, 62)
-    heart_cy = 56
+    heart_size = (80, 74)
+    heart_cy = 58
     heart_frac = player.hp / player.max_hp if player.max_hp else 0
     heart_img = _render_heart_icon(heart_frac, heart_size)
     img.paste(heart_img, (int(icon_x - heart_size[0] / 2), int(heart_cy - heart_size[1] / 2)), heart_img)
-    _outlined_text(draw, icon_x, heart_cy - 4, str(player.hp), _font(18))
+    _outlined_text(draw, icon_x, heart_cy - 6, str(player.hp), _font(18))
     _centered(draw, icon_x, heart_cy + heart_size[1] / 2 + 4, "HP", _font(11), MUTED_COLOR)
 
-    potion_size = (54, 76)
-    potion_cy = 138
+    potion_size = (64, 92)
+    potion_cy = 151
     mana_frac = player.mana / player.max_mana if player.max_mana else 0
     potion_img = _render_potion_icon(mana_frac, potion_size)
     img.paste(potion_img, (int(icon_x - potion_size[0] / 2), int(potion_cy - potion_size[1] / 2)), potion_img)
-    _outlined_text(draw, icon_x, potion_cy + 18, str(player.mana), _font(16))
+    _outlined_text(draw, icon_x, potion_cy + 11, str(player.mana), _font(16))
     _centered(draw, icon_x, potion_cy + potion_size[1] / 2 + 4, "Mana", _font(11), MUTED_COLOR)
 
-    box_w, box_h = 150, 112
+    thumb_w, thumb_h = 110, 154  # matches the card art's aspect ratio (300x420)
+    label_h = 22
+    box_w, box_h = thumb_w + 16, thumb_h + label_h + 12
     box_x = 24 if is_left else BOARD_W - 24 - box_w
-    box_y = 300
+    box_y = 290
+
     overlay = Image.new("RGBA", (box_w, box_h), PANEL_BG)
     img.paste(overlay, (box_x, box_y), overlay)
     draw.rectangle([box_x, box_y, box_x + box_w, box_y + box_h], outline=(255, 255, 255), width=2)
-    _centered(draw, box_x + box_w / 2, box_y + 8, "Discard", _font(15), TEXT_COLOR)
-    _centered(draw, box_x + box_w / 2, box_y + 34, str(player.discard_count), _font(24), TEXT_COLOR)
-    _centered(draw, box_x + box_w / 2, box_y + 68, f"Hand {player.hand_count}", _font(13), MUTED_COLOR)
-    _centered(draw, box_x + box_w / 2, box_y + 88, f"Deck {player.deck_count}", _font(13), MUTED_COLOR)
+    _centered(draw, box_x + box_w / 2, box_y + 6, "Last Discard", _font(13), TEXT_COLOR)
+
+    thumb_x, thumb_y = box_x + (box_w - thumb_w) // 2, box_y + label_h
+    if player.last_discard_card_id:
+        thumb = _load_card_image(player.last_discard_card_id).resize((thumb_w, thumb_h))
+        img.paste(thumb, (thumb_x, thumb_y))
+        draw.rectangle([thumb_x, thumb_y, thumb_x + thumb_w, thumb_y + thumb_h], outline=(255, 255, 255), width=2)
+    else:
+        draw.rectangle([thumb_x, thumb_y, thumb_x + thumb_w, thumb_y + thumb_h],
+                        fill=(45, 47, 56), outline=(140, 140, 150), width=2)
+        _centered(draw, thumb_x + thumb_w / 2, thumb_y + thumb_h / 2 - 8, "No discards", _font(12), MUTED_COLOR)
+        _centered(draw, thumb_x + thumb_w / 2, thumb_y + thumb_h / 2 + 8, "yet", _font(12), MUTED_COLOR)
 
 
 def render_battle_image(state: BattleRenderState) -> bytes:
