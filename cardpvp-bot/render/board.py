@@ -11,20 +11,39 @@ principle as game/engine.py.
 from __future__ import annotations
 
 import io
-import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).parent.parent
 BACKGROUND_PATH = ROOT / "assets" / "board" / "hex_background.png"
 CARDS_DIR = ROOT / "assets" / "cards"
 BLANK_CARD_PATH = CARDS_DIR / "_blank.png"
+ICONS_DIR = ROOT / "assets" / "icons"
 
 BOARD_W, BOARD_H = 900, 600
 CARD_SLOT_W, CARD_SLOT_H = 260, 340
+
+# Fill-level sprite sets (5 discrete frames each, not a continuous procedural
+# fill) -- thresholds are the midpoints between each sprite's actual measured
+# fill percentage, so a given HP/Mana fraction snaps to whichever pre-made
+# frame it's visually closest to.
+HEART_LEVELS = [
+    (0.925, "heart_1.png"),  # ~94% fill
+    (0.805, "heart_2.png"),  # ~91% fill
+    (0.585, "heart_3.png"),  # ~70% fill
+    (0.355, "heart_4.png"),  # ~47% fill
+    (0.0, "heart_5.png"),    # ~24% fill -- also the floor for anything lower, including 0
+]
+POTION_LEVELS = [
+    (0.66, "potion_1.png"),   # ~71% fill
+    (0.565, "potion_2.png"),  # ~61% fill
+    (0.46, "potion_3.png"),   # ~52% fill
+    (0.33, "potion_4.png"),   # ~40% fill
+    (0.0, "potion_5.png"),    # ~26% fill -- also the floor for anything lower, including 0
+]
 
 PFP_ACCENTS = [(79, 209, 197), (246, 173, 85)]  # left player, right player
 TEXT_COLOR = (255, 255, 255)
@@ -60,150 +79,50 @@ def _outlined_text(draw: ImageDraw.ImageDraw, cx: float, cy: float, text: str, f
     draw.text((x, y), text, font=font, fill=fill)
 
 
-SS = 4  # supersample factor for smooth anti-aliased edges on the small HP/Mana icons
+def _select_sprite(fraction: float, levels: list[tuple[float, str]]) -> str:
+    fraction = max(0.0, min(1.0, fraction))
+    for threshold, filename in levels:
+        if fraction >= threshold:
+            return filename
+    return levels[-1][1]
+
+
+_icon_cache: dict[str, Image.Image] = {}
+
+
+def _load_icon_sprite(filename: str) -> Image.Image:
+    """Loads an icon sprite, auto-cropped to its visible silhouette -- the source images
+    have a very faint semi-transparent halo (soft shadow / anti-aliasing falloff) extending
+    almost to the canvas edges, invisible to the eye but non-zero, which plain getbbox()
+    would include -- so crop against a THRESHOLDED alpha mask instead, or the "crop"
+    does effectively nothing and the real icon gets squished when resized into a much
+    smaller target box. Cached since these are static files reloaded on every board render."""
+    cached = _icon_cache.get(filename)
+    if cached is not None:
+        return cached
+    img = Image.open(ICONS_DIR / filename).convert("RGBA")
+    alpha_mask = img.split()[-1].point(lambda a: 255 if a > 25 else 0)
+    bbox = alpha_mask.getbbox()
+    if bbox:
+        img = img.crop(bbox)
+    _icon_cache[filename] = img
+    return img
 
 
 def _render_heart_icon(fraction: float, size: tuple[int, int]) -> Image.Image:
-    """A chubby, glossy heart (two circular lobes + a kite-shaped bottom), grey-blue when
-    empty and filling with red liquid from the bottom up according to `fraction` (0..1) --
-    matches the reference "glass heart" game-icon style. Used for the HP indicator."""
-    w, h = size
-    W, H = w * SS, h * SS
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-
-    r = W * 0.30
-    cy_lobe = H * 0.34
-    cx1, cx2 = W * 0.32, W * 0.68
-
-    def heart_shape(d, fill):
-        d.ellipse([cx1 - r, cy_lobe - r, cx1 + r, cy_lobe + r], fill=fill)
-        d.ellipse([cx2 - r, cy_lobe - r, cx2 + r, cy_lobe + r], fill=fill)
-        d.polygon([
-            (W * 0.5, H * 0.24),   # top point tucks into the valley between the lobes
-            (W * 0.97, H * 0.40),  # right point reaches the right lobe's outer edge
-            (W * 0.5, H * 0.94),   # bottom tip
-            (W * 0.03, H * 0.40),  # left point reaches the left lobe's outer edge
-        ], fill=fill)
-
-    # unified silhouette mask -- single source of truth, so there are no seams
-    # where the two circles and the wedge meet (drawing separate outlines per
-    # shape instead causes visible line artifacts at the overlaps).
-    mask = Image.new("L", (W, H), 0)
-    heart_shape(ImageDraw.Draw(mask), 255)
-
-    shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    shadow_layer.paste((0, 0, 0, 150), (0, int(H * 0.06)), mask)
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SS * 2.2))
-    img.alpha_composite(shadow_layer)
-
-    base_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    base_layer.paste((150, 168, 190, 255), (0, 0), mask)
-    img.alpha_composite(base_layer)
-
-    top_y, bottom_y = cy_lobe - r, H * 0.94
-    fill_h = (bottom_y - top_y) * max(0.0, min(1.0, fraction))
-    fill_top = bottom_y - fill_h
-    liquid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    if fill_h > 0:
-        ld = ImageDraw.Draw(liquid)
-        ld.rectangle([0, fill_top, W, H], fill=(210, 35, 48, 255))
-        ld.rectangle([0, fill_top, W, fill_top + SS * 1.5], fill=(150, 20, 34, 255))  # seam shading
-    liquid.putalpha(ImageChops.multiply(liquid.split()[3], mask))
-    img.alpha_composite(liquid)
-
-    # outline derived by eroding the SAME mask -- guarantees a clean, seamless ring
-    eroded = mask.filter(ImageFilter.MinFilter(int(SS * 3.2) * 2 + 1))
-    ring = ImageChops.subtract(mask, eroded)
-    img.paste((255, 255, 255, 255), (0, 0), ring)
-
-    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(hl)
-    hd.ellipse([cx1 - r * 0.55, cy_lobe - r * 0.75, cx1 + r * 0.15, cy_lobe - r * 0.05], fill=(255, 255, 255, 200))
-    hd.ellipse([cx2 - r * 0.55, cy_lobe - r * 0.75, cx2 + r * 0.15, cy_lobe - r * 0.05], fill=(255, 255, 255, 160))
-    img.alpha_composite(hl)
-
-    return img.resize((w, h), Image.LANCZOS)
+    """Loads the pre-made heart sprite (see assets/icons/) whose fill level is closest to
+    `fraction` (0..1) and scales it to `size`. Used for the HP indicator."""
+    filename = _select_sprite(fraction, HEART_LEVELS)
+    return _load_icon_sprite(filename).resize(size, Image.LANCZOS)
 
 
 def _render_potion_icon(fraction: float, size: tuple[int, int]) -> Image.Image:
-    """A glossy glass potion bottle -- round bulb, narrow neck with a rim highlight, and a
-    textured cork -- filling with blue liquid from the bottom up according to `fraction`
-    (0..1). Matches the reference game-icon style. Used for the Mana indicator."""
-    w, h = size
-    W, H = w * SS, h * SS
-    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    """Loads the pre-made potion sprite (see assets/icons/) whose fill level is closest to
+    `fraction` (0..1) and scales it to `size`. Used for the Mana indicator."""
+    filename = _select_sprite(fraction, POTION_LEVELS)
+    return _load_icon_sprite(filename).resize(size, Image.LANCZOS)
 
-    bulb_r = W * 0.40
-    bulb_cx, bulb_cy = W * 0.5, H * 0.62
-    neck_w, neck_h = W * 0.30, H * 0.16
-    neck_top = bulb_cy - bulb_r - neck_h * 0.55
-    cork_w, cork_h = W * 0.36, H * 0.16
-    cork_top = neck_top - cork_h * 0.65
 
-    def bottle_shape(d, fill):
-        d.rounded_rectangle(
-            [bulb_cx - neck_w / 2, neck_top, bulb_cx + neck_w / 2, neck_top + neck_h + bulb_r * 0.3],
-            radius=neck_w * 0.15, fill=fill,
-        )
-        d.ellipse([bulb_cx - bulb_r, bulb_cy - bulb_r, bulb_cx + bulb_r, bulb_cy + bulb_r], fill=fill)
-
-    mask = Image.new("L", (W, H), 0)
-    bottle_shape(ImageDraw.Draw(mask), 255)
-
-    shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    shadow_layer.paste((0, 0, 0, 150), (0, int(H * 0.04)), mask)
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(SS * 2.2))
-    img.alpha_composite(shadow_layer)
-
-    base_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    base_layer.paste((160, 185, 208, 255), (0, 0), mask)
-    img.alpha_composite(base_layer)
-
-    top_y, bottom_y = neck_top, bulb_cy + bulb_r
-    fill_h = (bottom_y - top_y) * max(0.0, min(1.0, fraction))
-    fill_top = bottom_y - fill_h
-    liquid = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    if fill_h > 0:
-        ld = ImageDraw.Draw(liquid)
-        ld.rectangle([0, fill_top, W, H], fill=(50, 160, 225, 255))
-        # meniscus -- a curved highlight arc right at the liquid surface
-        ld.ellipse([bulb_cx - bulb_r * 0.85, fill_top - H * 0.02, bulb_cx + bulb_r * 0.85, fill_top + H * 0.05],
-                   fill=(90, 190, 240, 255))
-    liquid.putalpha(ImageChops.multiply(liquid.split()[3], mask))
-    img.alpha_composite(liquid)
-
-    eroded = mask.filter(ImageFilter.MinFilter(int(SS * 2.8) * 2 + 1))
-    ring = ImageChops.subtract(mask, eroded)
-    img.paste((255, 255, 255, 255), (0, 0), ring)
-
-    draw = ImageDraw.Draw(img)
-    rim_y = neck_top + neck_h * 0.35
-    draw.line([(bulb_cx - neck_w / 2 + SS, rim_y), (bulb_cx + neck_w / 2 - SS, rim_y)],
-              fill=(230, 240, 250, 200), width=int(SS * 1.2))
-
-    cork_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    cd = ImageDraw.Draw(cork_layer)
-    cd.ellipse([bulb_cx - cork_w / 2, cork_top, bulb_cx + cork_w / 2, cork_top + cork_h * 0.7],
-               fill=(178, 138, 88, 255))
-    cd.rounded_rectangle(
-        [bulb_cx - cork_w * 0.4, cork_top + cork_h * 0.35, bulb_cx + cork_w * 0.4, cork_top + cork_h * 1.3],
-        radius=cork_w * 0.15, fill=(178, 138, 88, 255),
-    )
-    cd.ellipse([bulb_cx - cork_w * 0.15, cork_top + cork_h * 0.15, bulb_cx + cork_w * 0.05, cork_top + cork_h * 0.4],
-               fill=(140, 105, 65, 255))  # texture dot
-    img.alpha_composite(cork_layer)
-    draw.rounded_rectangle(
-        [bulb_cx - cork_w * 0.42, cork_top - SS, bulb_cx + cork_w * 0.42, cork_top + cork_h * 1.3],
-        radius=cork_w * 0.15, outline=(110, 80, 45, 255), width=int(SS * 0.8),
-    )
-
-    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(hl)
-    hd.ellipse([bulb_cx - bulb_r * 0.65, bulb_cy - bulb_r * 0.65, bulb_cx - bulb_r * 0.05, bulb_cy - bulb_r * 0.05],
-               fill=(255, 255, 255, 170))
-    img.alpha_composite(hl)
-
-    return img.resize((w, h), Image.LANCZOS)
 
 
 def _load_background() -> Image.Image:
@@ -285,20 +204,20 @@ def _draw_player_side(img: Image.Image, draw: ImageDraw.ImageDraw, player: Playe
 
     icon_x = pfp_cx + (100 if is_left else -100)
 
-    heart_size = (80, 74)
-    heart_cy = 58
+    heart_size = (80, 66)  # matches the sprite's native ~1.22:1 aspect ratio
+    heart_cy = 54
     heart_frac = player.hp / player.max_hp if player.max_hp else 0
     heart_img = _render_heart_icon(heart_frac, heart_size)
     img.paste(heart_img, (int(icon_x - heart_size[0] / 2), int(heart_cy - heart_size[1] / 2)), heart_img)
-    _outlined_text(draw, icon_x, heart_cy - 6, str(player.hp), _font(18))
+    _outlined_text(draw, icon_x, heart_cy - 4, str(player.hp), _font(17))
     _centered(draw, icon_x, heart_cy + heart_size[1] / 2 + 4, "HP", _font(11), MUTED_COLOR)
 
-    potion_size = (64, 92)
-    potion_cy = 151
+    potion_size = (64, 104)  # matches the sprite's native ~0.61:1 aspect ratio
+    potion_cy = 157
     mana_frac = player.mana / player.max_mana if player.max_mana else 0
     potion_img = _render_potion_icon(mana_frac, potion_size)
     img.paste(potion_img, (int(icon_x - potion_size[0] / 2), int(potion_cy - potion_size[1] / 2)), potion_img)
-    _outlined_text(draw, icon_x, potion_cy + 11, str(player.mana), _font(16))
+    _outlined_text(draw, icon_x, potion_cy + 30, str(player.mana), _font(16))
     _centered(draw, icon_x, potion_cy + potion_size[1] / 2 + 4, "Mana", _font(11), MUTED_COLOR)
 
     thumb_w, thumb_h = 110, 154  # matches the card art's aspect ratio (300x420)

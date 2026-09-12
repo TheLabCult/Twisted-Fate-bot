@@ -137,6 +137,9 @@ class PlayerState:
     def gain_mana(self, amount: int = 1) -> None:
         self.mana = min(self.mana + amount, MAX_MANA)
 
+    def take_damage(self, amount: int) -> None:
+        self.hp = max(0, self.hp - amount)
+
 
 @dataclass
 class ActionResult:
@@ -416,8 +419,8 @@ class Match:
             defender.gain_mana(1)
             resolution = f"<@{defender_id}> takes the hit and gains 1 mana ({defender.mana}/{MAX_MANA})."
 
-        defender.hp -= damage_to_defender
-        attacker.hp -= damage_to_attacker
+        defender.take_damage(damage_to_defender)
+        attacker.take_damage(damage_to_attacker)
         self.awaiting_reaction = None
 
         if attacker.hp <= 0:

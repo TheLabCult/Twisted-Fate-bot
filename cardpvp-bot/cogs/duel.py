@@ -25,7 +25,7 @@ Requires the bot to have the "Manage Channels" permission in the server.
 
 import asyncio
 import io
-import json
+import sqlite3
 import discord
 import uuid
 from pathlib import Path
@@ -47,7 +47,7 @@ CATEGORIES = ["Red", "Blue", "Green", "Yellow", "Purple"]
 CATEGORY_EMOJI = {"Red": "🔴", "Blue": "🔵", "Green": "🟢", "Yellow": "🟡", "Purple": "🟣"}
 DUEL_CATEGORY_NAME = "Duels"
 
-REGISTRY_PATH = Path(__file__).parent.parent / "runtime" / "active_duel_channels.json"
+DB_PATH = Path(__file__).parent.parent / "runtime" / "duel_channels.db"
 
 
 def describe_passive_compact(card: Card) -> str:
@@ -125,35 +125,85 @@ def describe_active_full(card: Card) -> str:
 # ---------------------------------------------------------------------------
 # Channel management
 # ---------------------------------------------------------------------------
+#
+# Every duel channel is tracked in a small SQLite table with an explicit
+# status: 'active' (still in use) or 'orphaned' (decided to be deleted --
+# either the delay just hasn't elapsed yet, or a previous process died
+# before it could finish the job). The status flips to 'orphaned' the
+# INSTANT we decide to delete something, before any delay or await --
+# so if the bot dies during the wait, the next startup's sweep still
+# finds it correctly flagged. A row is only removed once the channel is
+# CONFIRMED gone from Discord; a failed delete (rate limit, transient
+# permission issue) leaves the row in place so it gets retried later
+# instead of silently falling out of tracking forever.
 
-def _load_registry() -> set[int]:
-    try:
-        with open(REGISTRY_PATH) as f:
-            return set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return set()
-
-
-def _save_registry(channel_ids: set[int]) -> None:
-    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(REGISTRY_PATH, "w") as f:
-        json.dump(list(channel_ids), f)
+def _get_db() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS duel_channels ("
+        "  channel_id INTEGER PRIMARY KEY,"
+        "  status TEXT NOT NULL DEFAULT 'active'"
+        ")"
+    )
+    return conn
 
 
 def _register_channel_id(channel_id: int) -> None:
-    """Marks a duel channel as 'live' on disk. Read back at startup to clean up
-    anything left behind by a shutdown that didn't run cleanly (crash, forced
-    kill, or -- notoriously on Windows -- Ctrl+C not letting async cleanup
-    finish before the process dies)."""
-    ids = _load_registry()
-    ids.add(channel_id)
-    _save_registry(ids)
+    with _get_db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO duel_channels (channel_id, status) VALUES (?, 'active')",
+            (channel_id,),
+        )
+
+
+def _mark_channel_orphaned(channel_id: int) -> None:
+    with _get_db() as conn:
+        conn.execute(
+            "INSERT INTO duel_channels (channel_id, status) VALUES (?, 'orphaned') "
+            "ON CONFLICT(channel_id) DO UPDATE SET status = 'orphaned'",
+            (channel_id,),
+        )
 
 
 def _unregister_channel_id(channel_id: int) -> None:
-    ids = _load_registry()
-    ids.discard(channel_id)
-    _save_registry(ids)
+    """Only call this once the channel is CONFIRMED gone from Discord (deleted, or a
+    NotFound proves it already was) -- never as a blanket 'we tried' cleanup step."""
+    with _get_db() as conn:
+        conn.execute("DELETE FROM duel_channels WHERE channel_id = ?", (channel_id,))
+
+
+def _load_orphaned_channel_ids() -> list[int]:
+    with _get_db() as conn:
+        rows = conn.execute("SELECT channel_id FROM duel_channels WHERE status = 'orphaned'").fetchall()
+    return [row[0] for row in rows]
+
+
+async def _delete_channel_and_unregister(channel: discord.TextChannel) -> bool:
+    """Attempts the actual Discord deletion. Only clears tracking on confirmed success or
+    confirmed absence (NotFound) -- a Forbidden or other transient failure leaves the row
+    in place so a future sweep retries it, rather than losing track of it forever."""
+    try:
+        await channel.delete(reason="Duel finished")
+        _unregister_channel_id(channel.id)
+        return True
+    except discord.NotFound:
+        _unregister_channel_id(channel.id)  # already gone -- fine, just stop tracking it
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False  # left tracked as 'orphaned' -- will be retried on next startup sweep
+
+
+def _schedule_channel_deletion(channel: discord.TextChannel, delay: int) -> None:
+    """Marks the channel orphaned IMMEDIATELY (synchronously, before any delay), then
+    schedules the actual delayed deletion as a background task."""
+    _mark_channel_orphaned(channel.id)
+    asyncio.create_task(_delayed_delete(channel, delay))
+
+
+async def _delayed_delete(channel: discord.TextChannel, delay: int) -> None:
+    await asyncio.sleep(delay)
+    await _delete_channel_and_unregister(channel)
 
 
 def _slugify_channel_name(a: discord.Member, b: discord.Member) -> str:
@@ -184,16 +234,6 @@ async def create_duel_channel(guild: discord.Guild, category: discord.CategoryCh
         overwrites=overwrites,
         reason=f"Duel channel for {player_a} vs {player_b}",
     )
-
-
-async def schedule_channel_deletion(channel: discord.TextChannel, delay: int):
-    await asyncio.sleep(delay)
-    try:
-        await channel.delete(reason="Duel finished")
-    except (discord.NotFound, discord.Forbidden):
-        pass  # already gone, or bot lost permission -- nothing more we can do
-    finally:
-        _unregister_channel_id(channel.id)
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +347,7 @@ class BuildDeckPromptView(discord.ui.View):
                 )
             except discord.HTTPException:
                 pass
-            asyncio.create_task(schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS))
+            _schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS)
 
     @discord.ui.button(label="Build My Deck", style=discord.ButtonStyle.primary)
     async def build(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -594,7 +634,7 @@ async def refresh_public_message(interaction: discord.Interaction, match, manage
         channel = channels.pop(match.match_id, None)
         if channel:
             await interaction.followup.send("This channel will be deleted in 10 minutes. GG!")
-            asyncio.create_task(schedule_channel_deletion(channel, BATTLE_END_CLEANUP_DELAY_SECONDS))
+            _schedule_channel_deletion(channel, BATTLE_END_CLEANUP_DELAY_SECONDS)
         return
 
     file = await render_board_file(match, members, avatar_cache)
@@ -617,7 +657,7 @@ async def update_public_message(match, manager, members, messages, channels, ava
         channel = channels.pop(match.match_id, None)
         if channel:
             await channel.send("This channel will be deleted in 10 minutes. GG!")
-            asyncio.create_task(schedule_channel_deletion(channel, BATTLE_END_CLEANUP_DELAY_SECONDS))
+            _schedule_channel_deletion(channel, BATTLE_END_CLEANUP_DELAY_SECONDS)
         return
 
     file = await render_board_file(match, members, avatar_cache)
@@ -652,7 +692,7 @@ class ChallengeView(discord.ui.View):
                 )
             except discord.HTTPException:
                 pass
-            asyncio.create_task(schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS))
+            _schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS)
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -671,7 +711,7 @@ class ChallengeView(discord.ui.View):
             content="Challenge declined. This channel will be deleted shortly.", embed=None, view=None,
         )
         if session:
-            asyncio.create_task(schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS))
+            _schedule_channel_deletion(session.channel, CHANNEL_CLEANUP_DELAY_SECONDS)
         self.stop()
 
 
@@ -730,37 +770,40 @@ class Duel(commands.Cog):
         channels_to_delete += [session.channel for session in self.drafts.values()]
 
         for channel in channels_to_delete:
-            try:
-                await channel.delete(reason="Bot shutting down")
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass  # already gone, or we lost permission -- nothing more we can do
-            finally:
-                _unregister_channel_id(channel.id)
+            _mark_channel_orphaned(channel.id)  # in case delete() below doesn't get to finish
+            await _delete_channel_and_unregister(channel)
 
     async def sweep_orphaned_channels(self):
         """
-        Called once on startup (after the bot is connected). Reads the
-        on-disk registry of channels that were live last time the process
-        ran and deletes any that are still sitting there -- this is what
+        Called once on startup (after the bot is connected). Deletes every
+        channel currently flagged 'orphaned' in the database -- this is what
         actually fixes channels surviving an unclean shutdown, since it
-        doesn't depend on any shutdown code having run at all.
+        doesn't depend on any shutdown code having run at all. Channels
+        still flagged 'active' are deliberately left alone here; only ones
+        explicitly marked for deletion (decline/timeout/game-over) count as
+        orphaned. A channel that fails to delete (permissions, a transient
+        API error) stays tracked for the next sweep to retry, instead of
+        being forgotten.
         """
-        orphaned_ids = _load_registry()
+        orphaned_ids = _load_orphaned_channel_ids()
         if not orphaned_ids:
             return
 
-        log_deleted = 0
+        deleted = 0
         for channel_id in orphaned_ids:
             try:
                 channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
-                await channel.delete(reason="Cleaning up duel channel orphaned by a previous shutdown")
-                log_deleted += 1
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass  # already gone, or we lost permission -- nothing more we can do
+            except discord.NotFound:
+                _unregister_channel_id(channel_id)
+                continue
+            except discord.HTTPException:
+                continue  # transient fetch failure -- leave tracked, retry on the next startup
 
-        _save_registry(set())  # registry is fully reconciled now, regardless of individual failures
-        if log_deleted:
-            print(f"[duel] Swept {log_deleted} orphaned duel channel(s) from a previous session.")
+            if await _delete_channel_and_unregister(channel):
+                deleted += 1
+
+        if deleted:
+            print(f"[duel] Swept {deleted} orphaned duel channel(s) from a previous session.")
 
     @app_commands.command(name="duel", description="Challenge another player to a card duel in a private channel.")
     async def duel(self, interaction: discord.Interaction, opponent: discord.Member):

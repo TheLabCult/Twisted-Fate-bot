@@ -23,10 +23,13 @@ cardpvp-bot/
 ├── scripts/
 │   └── generate_assets.py      # dev tool: (re)generates everything in assets/
 ├── assets/
-│   ├── cards/                    # one placeholder PNG per card, keyed by
-│   │                              # card id (e.g. fireball.png), + _blank.png
-│   └── board/
-│       └── hex_background.png    # pre-rendered board background
+│   ├── cards/                    # one card art PNG per card, keyed by card
+│   │                              # id (e.g. fireball.png), + _blank.png
+│   ├── board/
+│   │   └── hex_background.png    # pre-rendered board background
+│   └── icons/
+│       ├── heart_1.png .. heart_5.png    # HP indicator, full -> empty
+│       └── potion_1.png .. potion_5.png  # Mana indicator, full -> empty
 ├── data/
 │   └── cards.json           # card definitions -- edit this to add/balance cards
 ├── requirements.txt
@@ -69,46 +72,70 @@ project's history for examples.
 6. In Discord: `/duel @someone`. A private channel is created; both players
    accept, build a 10-card deck (paged by color), then play.
 
-## Regenerating card art / the board background
+## Card art
 
-`assets/` is pre-generated, not built at runtime — the bot just loads
-whatever PNGs are sitting there. If you edit `data/cards.json` (add cards,
-rename them, recolor them), regenerate the matching art:
+All 50 cards use real artwork (`assets/cards/<card_id>.png`), each flagged
+`"custom_art": true` in `data/cards.json` so `scripts/generate_assets.py`
+won't overwrite it. If you add a *new* card without commissioned art yet,
+leave that flag off and run:
 
 ```bash
 python scripts/generate_assets.py
 ```
 
-This is placeholder art (flat color + shape + text baked in from each
-card's stats) — swap in real illustrations later by replacing the PNGs in
-`assets/cards/` with same-named files; `render/board.py` doesn't care how
-they were made, only that a file exists at `assets/cards/<card_id>.png`.
+This generates simple placeholder art (flat color + shape + text baked in
+from the card's stats) for any card missing `custom_art`, plus the board
+background. Swap in real art later by dropping a same-named PNG into
+`assets/cards/` and setting the flag — `render/board.py` doesn't care how
+the file was made, only that it exists.
+
+## HP / Mana icons
+
+`assets/icons/` holds 5 fill-level sprites each for the heart (HP) and
+potion (Mana) indicators — `heart_1.png`/`potion_1.png` are fullest,
+`heart_5.png`/`potion_5.png` are emptiest. These are real sprites, not
+generated. `render/board.py` picks whichever level is closest to the
+player's actual HP/Mana fraction (see `HEART_LEVELS`/`POTION_LEVELS`) --
+it's a discrete 5-step snap, not a continuous fill. To use a different
+icon set, replace these 10 files (keeping the same names and full-to-empty
+ordering) or adjust the threshold tables if you have a different number
+of levels.
 
 ## What's implemented
 
 - Private per-duel channel under a "Duels" category, visible only to the
-  two players; auto-deleted 10 minutes after a match ends (or immediately,
-  for declined/timed-out challenges), and swept on bot shutdown too.
+  two players; auto-deleted 10 minutes after a match ends (or quickly, for
+  declined/timed-out challenges). Which channels are pending deletion is
+  tracked in `runtime/duel_channels.db` (SQLite), so a channel whose delete
+  never got to run (crash, forced kill, a flaky shutdown) still gets swept
+  up the next time the bot starts — the sweep isn't a best-effort shutdown
+  hook, it's the actual mechanism, and it retries anything that fails
+  rather than losing track of it.
 - Deckbuilding: pick exactly 10 of 50 cards, browsable by color (Red /
   Blue / Green / Yellow / Purple), via a private ephemeral menu.
 - Turn-based combat: attack (pay mana, deal damage) → opponent reacts
   (block / take it) → turn passes. Hands are private even though the
   channel itself is shared with your opponent.
-- Four passive-ability archetypes: plain block, full negate vs. one
-  specific color, bonus block vs. one specific color, and reflect
-  (redirects damage back at the attacker, which can kill them).
-- A rendered battle board (HP hearts, mana stars, avatar placeholders,
-  Attacker/Defender labels, the currently-in-flight card's art) instead of
-  a text embed, regenerated as a fresh PNG on every action.
+- Five passive-ability archetypes (plain block, full negate vs. one
+  color, bonus block vs. one color, unconditional reflect, and reflect
+  vs. one color) and five active-ability archetypes (plain damage,
+  conditional bonus damage, mana swap, HP swap, and conditional
+  heal/mana-gain) — see `game/engine.py`'s `PassiveEffect`/`ActiveEffect`
+  enums.
+- A rendered battle board — real card art, real player avatars (circle-
+  cropped from Discord, cached per match), sprite-based HP/Mana indicators
+  (`assets/icons/`), Attacker/Defender labels, the currently-in-flight
+  card — instead of a text embed, regenerated as a fresh PNG on every
+  action. Pillow rendering runs in a background thread so it can't block
+  other players' interactions while it draws.
 - `/forfeit`.
 
 ## What's still stubbed out / natural next steps
 
-- **Real card art** — currently generated placeholders; see the
-  regeneration section above for how to swap in real illustrations.
-- **Real player avatars** — the board uses generic colored circles with
-  initials rather than each player's actual Discord avatar. Fetchable via
-  `member.display_avatar`, just not wired in yet.
-- **Persistence** — everything (matches, drafts, message/channel
-  references) lives in memory and resets if the bot restarts mid-game.
+- **Match state doesn't survive a restart** — `MatchManager`, draft
+  sessions, and the board message/channel references are all in-memory.
+  If the bot restarts mid-game, the players' buttons go dead (the channel
+  itself still gets cleaned up correctly via the DB-backed sweep above,
+  just the match itself is lost). Persisting match state to the same
+  SQLite file would be the natural next step.
 - **Win/loss records, matchmaking queue, ELO** — not started.
