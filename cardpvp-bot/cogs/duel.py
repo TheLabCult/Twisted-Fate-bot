@@ -34,8 +34,11 @@ from discord import app_commands
 from discord.ext import commands
 
 from game.cards import load_card_pool
-from game.engine import DECK_SIZE, MAX_MANA, STARTING_HP, ActiveCondition, ActiveEffect, Card, MatchManager, PassiveEffect
-from render.board import BattleRenderState, PlayerRenderState, render_battle_image
+from game.engine import (
+    DECK_SIZE, MAX_MANA, STARTING_HP, ActiveCondition, ActiveEffect, Card, MatchManager, PassiveEffect,
+    passive_has_effect,
+)
+from render.board import BattleRenderState, PlayerRenderState, render_battle_image, render_hand_image
 
 CHALLENGE_TIMEOUT_SECONDS = 120
 DECKBUILD_TIMEOUT_SECONDS = 300
@@ -64,20 +67,6 @@ def describe_passive_compact(card: Card) -> str:
     return f"🛡{card.passive_cost}/{card.passive_block}"
 
 
-def describe_passive_full(card: Card) -> str:
-    """Longer form for the in-match Block menu, where only 3 hand cards are ever listed."""
-    if card.passive_effect == PassiveEffect.NEGATE_COLOR:
-        return f"Cost {card.passive_cost} • fully blocks {card.passive_condition_color} attacks (else blocks {card.passive_block})"
-    if card.passive_effect == PassiveEffect.BLOCK_BONUS_COLOR:
-        total = card.passive_block + card.passive_bonus_block
-        return f"Cost {card.passive_cost} • blocks {card.passive_block} (blocks {total} vs {card.passive_condition_color})"
-    if card.passive_effect == PassiveEffect.REFLECT:
-        return f"Cost {card.passive_cost} • reflects all damage back at the attacker"
-    if card.passive_effect == PassiveEffect.REFLECT_COLOR:
-        return f"Cost {card.passive_cost} • reflects vs {card.passive_condition_color} (else blocks {card.passive_block})"
-    return f"Cost {card.passive_cost} • blocks {card.passive_block}"
-
-
 def _active_condition_text(card: Card) -> str:
     if card.active_condition == ActiveCondition.LOWER_HP:
         return "if lower HP"
@@ -100,23 +89,6 @@ def describe_active_compact(card: Card) -> str:
         return f"⚔{card.active_cost} +{card.active_mana_gain} mana ({_active_condition_text(card)})"
 
     base = f"⚔{card.active_cost} {card.active_damage}dmg"
-    if card.active_condition != ActiveCondition.NONE and card.active_bonus_damage:
-        base += f" (+{card.active_bonus_damage} {_active_condition_text(card)})"
-    return base
-
-
-def describe_active_full(card: Card) -> str:
-    """Longer form for the in-match Attack menu."""
-    if card.active_effect == ActiveEffect.SWAP_MANA:
-        return f"Cost {card.active_cost} • swaps your mana with your opponent's"
-    if card.active_effect == ActiveEffect.SWAP_HP:
-        return f"Cost {card.active_cost} • swaps your HP with your opponent's"
-    if card.active_effect == ActiveEffect.HEAL_IF_COLOR:
-        return f"Cost {card.active_cost} • heal {card.active_heal_amount} HP ({_active_condition_text(card)})"
-    if card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
-        return f"Cost {card.active_cost} • gain {card.active_mana_gain} mana ({_active_condition_text(card)})"
-
-    base = f"Cost {card.active_cost} • {card.active_damage} dmg"
     if card.active_condition != ActiveCondition.NONE and card.active_bonus_damage:
         base += f" (+{card.active_bonus_damage} {_active_condition_text(card)})"
     return base
@@ -281,7 +253,8 @@ async def render_board_file(match, members: dict[int, discord.Member], avatar_ca
     played_card_caption = None
     if match.awaiting_reaction:
         played_card_id = match.awaiting_reaction.template_id
-        played_card_caption = f"{members[match.awaiting_reaction.attacker_id].display_name} attacks"
+        verb = "plays" if match.awaiting_reaction.is_utility else "attacks"
+        played_card_caption = f"{members[match.awaiting_reaction.attacker_id].display_name} {verb}"
     elif match.last_played:
         played_card_id = match.last_played.template_id
         verb = "attacked with" if match.last_played.role == "active" else "blocked with"
@@ -507,8 +480,9 @@ class PublicView(discord.ui.View):
         self.avatar_cache = avatar_cache
 
         if match.awaiting_reaction:
+            decline_label = "Let it Happen (+1 Mana)" if match.awaiting_reaction.is_utility else "Take Damage (+1 Mana)"
             self._add_button("Block", discord.ButtonStyle.primary, self._on_block_open)
-            self._add_button("Take Damage (+1 Mana)", discord.ButtonStyle.secondary, self._on_take_damage)
+            self._add_button(decline_label, discord.ButtonStyle.secondary, self._on_take_damage)
         else:
             self._add_button("Attack", discord.ButtonStyle.primary, self._on_attack_open)
             self._add_button("Skip Turn (+1 Mana)", discord.ButtonStyle.secondary, self._on_skip)
@@ -526,11 +500,12 @@ class PublicView(discord.ui.View):
         if not attacker.hand:
             await interaction.response.send_message("You have no cards to attack with.", ephemeral=True)
             return
-        view = HandSelectView(
+        view = HandView(
             match=self.match, manager=self.manager, members=self.members,
             messages=self.messages, channels=self.channels, avatar_cache=self.avatar_cache, mode="attack",
         )
-        await interaction.response.send_message("Choose a card to attack with:", view=view, ephemeral=True)
+        file = await view.render_file()
+        await interaction.response.send_message("Your hand:", file=file, view=view, ephemeral=True)
 
     async def _on_block_open(self, interaction: discord.Interaction):
         pending = self.match.awaiting_reaction
@@ -539,13 +514,15 @@ class PublicView(discord.ui.View):
             return
         defender = self.match.players[interaction.user.id]
         if not defender.hand:
-            await interaction.response.send_message("You have no cards to block with.", ephemeral=True)
+            await interaction.response.send_message("You have no cards in hand.", ephemeral=True)
             return
-        view = HandSelectView(
+        view = HandView(
             match=self.match, manager=self.manager, members=self.members,
             messages=self.messages, channels=self.channels, avatar_cache=self.avatar_cache, mode="block",
         )
-        await interaction.response.send_message("Choose a card to block with:", view=view, ephemeral=True)
+        file = await view.render_file()
+        content = "Your hand:" if view.any_usable else "None of your cards would have any effect here — your hand, for reference:"
+        await interaction.response.send_message(content, file=file, view=view, ephemeral=True)
 
     async def _on_skip(self, interaction: discord.Interaction):
         if interaction.user.id != self.match.active_player_id:
@@ -565,12 +542,14 @@ class PublicView(discord.ui.View):
                                       self.messages, self.channels, self.avatar_cache, result)
 
 
-class HandSelectView(discord.ui.View):
+class HandView(discord.ui.View):
     """
-    Ephemeral -- only the acting player ever sees this. Lists their real
-    hand with real stats, since Discord guarantees ephemeral replies are
-    private to the invoking user (even inside a channel your opponent
-    can also see).
+    Ephemeral -- only the acting player ever sees this. Shows the actual hand as a rendered
+    image (card art, not a text list) with numbered buttons underneath matching the badges
+    in the image. For a reaction, cards that would have no effect are dimmed in the image
+    and get no button at all -- but they're still SHOWN, so the player can see their whole
+    hand and understand why they're stuck, not just be told "nothing works" with no context.
+    If literally nothing is usable, the only button offered is the decline action.
     """
 
     def __init__(self, match, manager: MatchManager, members: dict[int, discord.Member],
@@ -586,24 +565,42 @@ class HandSelectView(discord.ui.View):
         self.mode = mode  # "attack" or "block"
 
         if mode == "attack":
-            hand = match.players[match.active_player_id].hand
-            options = [
-                discord.SelectOption(label=c.name, description=describe_active_full(c), value=c.id)
-                for c in hand
-            ]
+            self.hand = list(match.players[match.active_player_id].hand)
+            attacker = match.players[match.active_player_id]
+            self.usable_flags = [c.active_cost <= attacker.mana for c in self.hand]
         else:
-            hand = match.players[match.awaiting_reaction.defender_id].hand
-            options = [
-                discord.SelectOption(label=c.name, description=describe_passive_full(c), value=c.id)
-                for c in hand
-            ]
+            self.hand = list(match.players[match.awaiting_reaction.defender_id].hand)
+            self.usable_flags = [passive_has_effect(c, match.awaiting_reaction) for c in self.hand]
 
-        select = discord.ui.Select(placeholder="Pick a card...", options=options)
-        select.callback = self._on_select
-        self.add_item(select)
+        self.any_usable = any(self.usable_flags)
 
-    async def _on_select(self, interaction: discord.Interaction):
-        card_id = interaction.data["values"][0]
+        for i, (card, usable) in enumerate(zip(self.hand, self.usable_flags)):
+            if not usable:
+                continue
+            btn = discord.ui.Button(label=str(i + 1), style=discord.ButtonStyle.primary)
+            btn.callback = self._make_pick_callback(card.id)
+            self.add_item(btn)
+
+        if mode == "block":
+            decline_label = "Let it Happen (+1 Mana)" if match.awaiting_reaction.is_utility else "Take Damage (+1 Mana)"
+            decline_btn = discord.ui.Button(label=decline_label, style=discord.ButtonStyle.secondary)
+            decline_btn.callback = self._on_decline
+            self.add_item(decline_btn)
+
+    async def render_file(self) -> discord.File:
+        card_ids = [c.template_id or c.id for c in self.hand]
+        png_bytes = await asyncio.to_thread(render_hand_image, card_ids, self.usable_flags)
+        return discord.File(io.BytesIO(png_bytes), filename="hand.png")
+
+    def _make_pick_callback(self, card_id: str):
+        async def callback(interaction: discord.Interaction):
+            await self._resolve(interaction, card_id)
+        return callback
+
+    async def _on_decline(self, interaction: discord.Interaction):
+        await self._resolve(interaction, None)
+
+    async def _resolve(self, interaction: discord.Interaction, card_id: Optional[str]):
         if self.mode == "attack":
             result = self.match.attack(interaction.user.id, card_id)
         else:

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).parent.parent
 BACKGROUND_PATH = ROOT / "assets" / "board" / "hex_background.png"
@@ -134,6 +134,56 @@ def _load_card_image(card_id: Optional[str]) -> Image.Image:
     if not path.exists():
         path = BLANK_CARD_PATH
     return Image.open(path).convert("RGB")
+
+
+HAND_THUMB_W, HAND_THUMB_H = 180, 252  # matches the card art's ~0.714 aspect ratio
+HAND_GAP = 24
+HAND_MARGIN = 24
+HAND_BADGE_H = 44
+
+
+def render_hand_image(card_ids: list[Optional[str]], usable_flags: Optional[list[bool]] = None) -> bytes:
+    """
+    Renders a horizontal row of card-art thumbnails, each with a numbered badge above it,
+    for the ephemeral hand-selection menu. If `usable_flags` is given (one bool per card),
+    any card flagged False is desaturated and darkened -- shown for context (so the player
+    can see their whole hand and understand *why* nothing helps) but visually marked as
+    not a valid pick, matching the numbered buttons Discord-side (which only appear for
+    usable cards).
+    """
+    n = max(1, len(card_ids))
+    width = HAND_MARGIN * 2 + n * HAND_THUMB_W + (n - 1) * HAND_GAP
+    height = HAND_MARGIN * 2 + HAND_BADGE_H + HAND_THUMB_H
+
+    img = Image.new("RGB", (width, height), (30, 32, 40))
+    draw = ImageDraw.Draw(img)
+
+    for i, card_id in enumerate(card_ids):
+        usable = usable_flags[i] if usable_flags else True
+        x = HAND_MARGIN + i * (HAND_THUMB_W + HAND_GAP)
+        y = HAND_MARGIN + HAND_BADGE_H
+
+        thumb = _load_card_image(card_id).resize((HAND_THUMB_W, HAND_THUMB_H))
+        if not usable:
+            grey = ImageOps.grayscale(thumb).convert("RGB")
+            thumb = Image.blend(thumb, grey, 0.75)
+            dark_overlay = Image.new("RGB", thumb.size, (0, 0, 0))
+            thumb = Image.blend(thumb, dark_overlay, 0.35)
+        img.paste(thumb, (x, y))
+        draw.rectangle([x, y, x + HAND_THUMB_W, y + HAND_THUMB_H],
+                       outline=(255, 255, 255) if usable else (110, 110, 118), width=3)
+
+        badge_color = (90, 160, 235) if usable else (80, 80, 90)
+        badge_r = 19
+        bx, by = x + HAND_THUMB_W / 2, HAND_MARGIN + HAND_BADGE_H / 2
+        draw.ellipse([bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+                     fill=badge_color, outline=(255, 255, 255), width=2)
+        _centered(draw, bx, by - 12, str(i + 1), _font(19), (255, 255, 255))
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 @dataclass

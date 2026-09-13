@@ -157,6 +157,42 @@ class PendingReaction:
     template_id: str
     color: str
     damage: int
+    is_utility: bool = False
+    utility_effect: ActiveEffect = ActiveEffect.DAMAGE
+    utility_heal_amount: int = 0
+    utility_mana_gain: int = 0
+    utility_condition_met: bool = False
+
+
+def passive_has_effect(card: "Card", pending: "PendingReaction") -> bool:
+    """
+    Whether playing `card`'s passive in reaction to `pending` would actually do
+    anything -- used to stop a defender from wasting mana and a card on a
+    reaction that provably can't affect the outcome (e.g. a plain BLOCK card
+    with passive_block=0, or any non-matching passive against a utility
+    effect, which only a matching NEGATE_COLOR can touch at all).
+    """
+    if pending.is_utility:
+        # Only a matching full negate can cancel a utility effect -- plain
+        # block/bonus-block/reflect have nothing (no damage) to act on.
+        return card.passive_effect == PassiveEffect.NEGATE_COLOR and card.passive_condition_color == pending.color
+
+    if pending.damage <= 0:
+        return False  # nothing to block or reflect
+
+    if card.passive_effect == PassiveEffect.BLOCK:
+        return card.passive_block > 0
+    if card.passive_effect == PassiveEffect.NEGATE_COLOR:
+        return pending.color == card.passive_condition_color or card.passive_block > 0
+    if card.passive_effect == PassiveEffect.BLOCK_BONUS_COLOR:
+        if card.passive_block > 0:
+            return True
+        return pending.color == card.passive_condition_color and card.passive_bonus_block > 0
+    if card.passive_effect == PassiveEffect.REFLECT:
+        return True
+    if card.passive_effect == PassiveEffect.REFLECT_COLOR:
+        return pending.color == card.passive_condition_color or card.passive_block > 0
+    return False
 
 
 @dataclass
@@ -237,7 +273,7 @@ class Match:
         defender = self.players[defender_id]
 
         if card.active_effect != ActiveEffect.DAMAGE:
-            return self._play_utility_active(attacker, defender, card)
+            return self._declare_utility_active(attacker, defender, card)
 
         # Conditional bonus damage is checked against state as it stood at
         # the moment of playing -- e.g. "hand is all Red" includes this
@@ -278,12 +314,14 @@ class Match:
             f"<@{defender_id}> may react.",
         )
 
-    def _play_utility_active(self, attacker: PlayerState, defender: PlayerState, card: Card) -> ActionResult:
+    def _declare_utility_active(self, attacker: PlayerState, defender: PlayerState, card: Card) -> ActionResult:
         """
-        Handles non-damage active effects (mana/HP swap, conditional heal,
-        conditional mana gain). None of these target the opponent with
-        damage, so there's nothing to react to -- the turn just resolves
-        and passes immediately, same as skip().
+        Handles playing a non-damage active card (mana/HP swap, conditional
+        heal, conditional mana gain). These don't hit the opponent with
+        damage, but they're still reactable -- a defender whose passive
+        NEGATE_COLORs the attacking card's color can cancel the effect
+        entirely (same as fully blocking an attack). Declining, or reacting
+        with a passive that doesn't match, lets the effect resolve in full.
         """
         # LAST_DISCARD_COLOR is checked against state BEFORE this card joins
         # the discard pile (otherwise it would always match itself).
@@ -296,6 +334,20 @@ class Match:
         attacker.mana -= card.active_cost
         attacker.hand.remove(card)
         attacker.discard.append(card)
+
+        self.awaiting_reaction = PendingReaction(
+            attacker_id=attacker.user_id,
+            defender_id=defender.user_id,
+            card_name=card.name,
+            template_id=card.template_id or card.id,
+            color=card.color,
+            damage=0,
+            is_utility=True,
+            utility_effect=card.active_effect,
+            utility_heal_amount=card.active_heal_amount,
+            utility_mana_gain=card.active_mana_gain,
+            utility_condition_met=condition_met,
+        )
         self.last_played = LastPlayed(
             player_id=attacker.user_id,
             card_name=card.name,
@@ -303,38 +355,37 @@ class Match:
             color=card.color,
             role="active",
         )
+        return ActionResult(
+            True,
+            f"<@{attacker.user_id}> plays **{card.name}**. <@{defender.user_id}> may react.",
+        )
 
-        if card.active_effect == ActiveEffect.SWAP_MANA:
+    def _apply_utility_effect(self, attacker: PlayerState, defender: PlayerState, pending: PendingReaction) -> str:
+        """Actually applies a utility effect that went unblocked. Returns a short message
+        describing what happened."""
+        if pending.utility_effect == ActiveEffect.SWAP_MANA:
             attacker.mana, defender.mana = defender.mana, attacker.mana
-            message = (
-                f"<@{attacker.user_id}> plays **{card.name}**, swapping mana with <@{defender.user_id}>! "
+            return (
+                f"**{pending.card_name}** swaps mana! "
                 f"Now {attacker.mana}/{MAX_MANA} vs {defender.mana}/{MAX_MANA}."
             )
-        elif card.active_effect == ActiveEffect.SWAP_HP:
+        if pending.utility_effect == ActiveEffect.SWAP_HP:
             # Safe without a fresh defeat-check: both values were already
             # positive (a match ends the instant either hits 0), so swapping
             # two positive numbers can't newly create a <=0 HP state.
             attacker.hp, defender.hp = defender.hp, attacker.hp
-            message = (
-                f"<@{attacker.user_id}> plays **{card.name}**, swapping HP with <@{defender.user_id}>! "
-                f"Now {attacker.hp} HP vs {defender.hp} HP."
-            )
-        elif card.active_effect == ActiveEffect.HEAL_IF_COLOR:
-            if condition_met:
-                attacker.hp = min(attacker.hp + card.active_heal_amount, STARTING_HP)
-                message = f"<@{attacker.user_id}> plays **{card.name}**, healing to {attacker.hp} HP!"
-            else:
-                message = f"<@{attacker.user_id}> plays **{card.name}**, but the heal condition wasn't met."
-        elif card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
-            if condition_met:
-                attacker.gain_mana(card.active_mana_gain)
-                message = f"<@{attacker.user_id}> plays **{card.name}**, gaining mana ({attacker.mana}/{MAX_MANA})!"
-            else:
-                message = f"<@{attacker.user_id}> plays **{card.name}**, but the mana condition wasn't met."
-        else:
-            message = f"<@{attacker.user_id}> plays **{card.name}**."
-
-        return self._end_turn(message)
+            return f"**{pending.card_name}** swaps HP! Now {attacker.hp} HP vs {defender.hp} HP."
+        if pending.utility_effect == ActiveEffect.HEAL_IF_COLOR:
+            if pending.utility_condition_met:
+                attacker.hp = min(attacker.hp + pending.utility_heal_amount, STARTING_HP)
+                return f"**{pending.card_name}** heals <@{attacker.user_id}> to {attacker.hp} HP!"
+            return f"**{pending.card_name}**'s heal condition wasn't met -- no effect."
+        if pending.utility_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
+            if pending.utility_condition_met:
+                attacker.gain_mana(pending.utility_mana_gain)
+                return f"**{pending.card_name}** grants <@{attacker.user_id}> mana ({attacker.mana}/{MAX_MANA})!"
+            return f"**{pending.card_name}**'s mana condition wasn't met -- no effect."
+        return f"**{pending.card_name}** resolves."
 
     def skip(self, user_id: int) -> ActionResult:
         if self.phase != GamePhase.IN_PROGRESS:
@@ -360,6 +411,10 @@ class Match:
         pending = self.awaiting_reaction
         defender = self.players[defender_id]
         attacker = self.players[pending.attacker_id]
+
+        if pending.is_utility:
+            return self._resolve_utility_reaction(defender_id, card_id)
+
         damage_to_defender = pending.damage
         damage_to_attacker = 0
 
@@ -369,6 +424,8 @@ class Match:
                 return ActionResult(False, "That card isn't in your hand.")
             if card.passive_cost > defender.mana:
                 return ActionResult(False, f"Not enough mana ({defender.mana}/{card.passive_cost} needed).")
+            if not passive_has_effect(card, pending):
+                return ActionResult(False, f"**{card.name}** would have no effect here — pick something else or take it.")
 
             defender.mana -= card.passive_cost
             defender.hand.remove(card)
@@ -441,6 +498,69 @@ class Match:
                 winner_id=pending.attacker_id,
             )
 
+        return self._end_turn(resolution)
+
+    def _resolve_utility_reaction(self, defender_id: int, card_id: Optional[str]) -> ActionResult:
+        """
+        Reaction to a non-damage active play (mana/HP swap, conditional
+        heal/mana-gain). Only a NEGATE_COLOR passive that matches the
+        attacking card's color can cancel the effect outright -- other
+        passive types (plain block, bonus block, reflect) have nothing to
+        reduce or redirect since there's no damage involved, so the effect
+        still resolves normally if the defender reacts with one of those
+        (they've just spent the card and mana for nothing). Declining lets
+        it resolve too, with the usual consolation mana.
+        """
+        pending = self.awaiting_reaction
+        defender = self.players[defender_id]
+        attacker = self.players[pending.attacker_id]
+        negated = False
+        declined = card_id is None
+
+        if not declined:
+            card = next((c for c in defender.hand if c.id == card_id), None)
+            if card is None:
+                return ActionResult(False, "That card isn't in your hand.")
+            if card.passive_cost > defender.mana:
+                return ActionResult(False, f"Not enough mana ({defender.mana}/{card.passive_cost} needed).")
+            if not passive_has_effect(card, pending):
+                return ActionResult(False, f"**{card.name}** would have no effect here — pick something else or let it happen.")
+
+            defender.mana -= card.passive_cost
+            defender.hand.remove(card)
+            defender.discard.append(card)
+            self.last_played = LastPlayed(
+                player_id=defender_id,
+                card_name=card.name,
+                template_id=card.template_id or card.id,
+                color=card.color,
+                role="passive",
+            )
+
+            if card.passive_effect == PassiveEffect.NEGATE_COLOR and pending.color == card.passive_condition_color:
+                negated = True
+                resolution = (
+                    f"<@{defender_id}> blocks with **{card.name}** — **{pending.card_name}** "
+                    f"is negated vs {pending.color}!"
+                )
+            else:
+                resolution = (
+                    f"<@{defender_id}> reacts with **{card.name}**, but it has no effect here."
+                )
+        else:
+            resolution = f"<@{defender_id}> lets it happen."
+
+        # Effect resolves using state as it stood at reaction time; any
+        # consolation mana for declining is granted AFTER, not before --
+        # otherwise a declined SWAP_MANA would swap in its own bonus.
+        if not negated:
+            resolution = f"{resolution} {self._apply_utility_effect(attacker, defender, pending)}"
+
+        if declined:
+            defender.gain_mana(1)
+            resolution = f"{resolution} (+1 mana, now {defender.mana}/{MAX_MANA})"
+
+        self.awaiting_reaction = None
         return self._end_turn(resolution)
 
     def forfeit(self, user_id: int) -> ActionResult:
