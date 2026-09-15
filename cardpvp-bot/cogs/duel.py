@@ -34,11 +34,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from game.cards import load_card_pool
-from game.engine import (
-    DECK_SIZE, MAX_MANA, STARTING_HP, ActiveCondition, ActiveEffect, Card, MatchManager, PassiveEffect,
-    passive_has_effect,
+from game.engine import DECK_SIZE, MAX_MANA, STARTING_HP, Card, MatchManager, passive_has_effect
+from render.board import (
+    BattleRenderState, PlayerRenderState, render_battle_image, render_deck_grid_image, render_hand_image,
 )
-from render.board import BattleRenderState, PlayerRenderState, render_battle_image, render_hand_image
 
 CHALLENGE_TIMEOUT_SECONDS = 120
 DECKBUILD_TIMEOUT_SECONDS = 300
@@ -51,47 +50,6 @@ CATEGORY_EMOJI = {"Red": "🔴", "Blue": "🔵", "Green": "🟢", "Yellow": "�
 DUEL_CATEGORY_NAME = "Duels"
 
 DB_PATH = Path(__file__).parent.parent / "runtime" / "duel_channels.db"
-
-
-def describe_passive_compact(card: Card) -> str:
-    """Short form for the deckbuilder, which has limited description space."""
-    if card.passive_effect == PassiveEffect.NEGATE_COLOR:
-        return f"🛡{card.passive_cost} full-block vs {card.passive_condition_color}"
-    if card.passive_effect == PassiveEffect.BLOCK_BONUS_COLOR:
-        total = card.passive_block + card.passive_bonus_block
-        return f"🛡{card.passive_cost} {card.passive_block} ({total} vs {card.passive_condition_color})"
-    if card.passive_effect == PassiveEffect.REFLECT:
-        return f"🛡{card.passive_cost} reflect dmg"
-    if card.passive_effect == PassiveEffect.REFLECT_COLOR:
-        return f"🛡{card.passive_cost} reflect vs {card.passive_condition_color}"
-    return f"🛡{card.passive_cost}/{card.passive_block}"
-
-
-def _active_condition_text(card: Card) -> str:
-    if card.active_condition == ActiveCondition.LOWER_HP:
-        return "if lower HP"
-    if card.active_condition == ActiveCondition.LAST_DISCARD_COLOR:
-        return f"if last discard is {card.active_condition_color}"
-    if card.active_condition == ActiveCondition.HAND_ALL_COLOR:
-        return f"if hand is all {card.active_condition_color}"
-    return ""
-
-
-def describe_active_compact(card: Card) -> str:
-    """Short form for the deckbuilder."""
-    if card.active_effect == ActiveEffect.SWAP_MANA:
-        return f"⚔{card.active_cost} swap mana"
-    if card.active_effect == ActiveEffect.SWAP_HP:
-        return f"⚔{card.active_cost} swap HP"
-    if card.active_effect == ActiveEffect.HEAL_IF_COLOR:
-        return f"⚔{card.active_cost} heal {card.active_heal_amount} ({_active_condition_text(card)})"
-    if card.active_effect == ActiveEffect.GAIN_MANA_IF_COLOR:
-        return f"⚔{card.active_cost} +{card.active_mana_gain} mana ({_active_condition_text(card)})"
-
-    base = f"⚔{card.active_cost} {card.active_damage}dmg"
-    if card.active_condition != ActiveCondition.NONE and card.active_bonus_damage:
-        base += f" (+{card.active_bonus_damage} {_active_condition_text(card)})"
-    return base
 
 
 # ---------------------------------------------------------------------------
@@ -115,26 +73,32 @@ def _get_db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS duel_channels ("
         "  channel_id INTEGER PRIMARY KEY,"
-        "  status TEXT NOT NULL DEFAULT 'active'"
+        "  status TEXT NOT NULL DEFAULT 'active',"
+        "  guild_id INTEGER"
         ")"
     )
+    # Migration for databases created before guild_id existed -- without this,
+    # upgrading an existing install would throw "no such column" on every query.
+    existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(duel_channels)")}
+    if "guild_id" not in existing_columns:
+        conn.execute("ALTER TABLE duel_channels ADD COLUMN guild_id INTEGER")
     return conn
 
 
-def _register_channel_id(channel_id: int) -> None:
+def _register_channel_id(channel_id: int, guild_id: int) -> None:
     with _get_db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO duel_channels (channel_id, status) VALUES (?, 'active')",
-            (channel_id,),
+            "INSERT OR REPLACE INTO duel_channels (channel_id, status, guild_id) VALUES (?, 'active', ?)",
+            (channel_id, guild_id),
         )
 
 
-def _mark_channel_orphaned(channel_id: int) -> None:
+def _mark_channel_orphaned(channel_id: int, guild_id: Optional[int] = None) -> None:
     with _get_db() as conn:
         conn.execute(
-            "INSERT INTO duel_channels (channel_id, status) VALUES (?, 'orphaned') "
+            "INSERT INTO duel_channels (channel_id, status, guild_id) VALUES (?, 'orphaned', ?) "
             "ON CONFLICT(channel_id) DO UPDATE SET status = 'orphaned'",
-            (channel_id,),
+            (channel_id, guild_id),
         )
 
 
@@ -145,10 +109,14 @@ def _unregister_channel_id(channel_id: int) -> None:
         conn.execute("DELETE FROM duel_channels WHERE channel_id = ?", (channel_id,))
 
 
-def _load_orphaned_channel_ids() -> list[int]:
+def _load_orphaned_channels() -> list[tuple[int, Optional[int]]]:
+    """Returns (channel_id, guild_id) pairs. guild_id may be None for rows written by an
+    older version before the column existed."""
     with _get_db() as conn:
-        rows = conn.execute("SELECT channel_id FROM duel_channels WHERE status = 'orphaned'").fetchall()
-    return [row[0] for row in rows]
+        rows = conn.execute(
+            "SELECT channel_id, guild_id FROM duel_channels WHERE status = 'orphaned'"
+        ).fetchall()
+    return [(row[0], row[1]) for row in rows]
 
 
 async def _delete_channel_and_unregister(channel: discord.TextChannel) -> bool:
@@ -169,7 +137,7 @@ async def _delete_channel_and_unregister(channel: discord.TextChannel) -> bool:
 def _schedule_channel_deletion(channel: discord.TextChannel, delay: int) -> None:
     """Marks the channel orphaned IMMEDIATELY (synchronously, before any delay), then
     schedules the actual delayed deletion as a background task."""
-    _mark_channel_orphaned(channel.id)
+    _mark_channel_orphaned(channel.id, channel.guild.id if channel.guild else None)
     asyncio.create_task(_delayed_delete(channel, delay))
 
 
@@ -338,18 +306,24 @@ class BuildDeckPromptView(discord.ui.View):
             return
 
         deckbuilder = DeckBuilderView(self.cog, self.draft_id, interaction.user.id)
+        file = await deckbuilder.render_file()
         await interaction.response.send_message(
-            f"Build your deck ({DECK_SIZE} cards):", view=deckbuilder, ephemeral=True,
+            f"Build your deck ({DECK_SIZE} cards):", file=file, view=deckbuilder, ephemeral=True,
         )
 
 
 class DeckBuilderView(discord.ui.View):
     """
     Ephemeral. Shows one color category at a time (Discord caps a message
-    at 5 component rows, and 5 simultaneous 10-option selects would leave
-    no room for Confirm/navigation) with Prev/Next tabs. Picks persist
-    across category switches and rebuild the view (with `default=True` on
-    already-picked options) so the UI reflects running state.
+    at 5 component rows, and 5 simultaneous 10-card pages would leave no
+    room for Confirm/navigation) with Prev/Next tabs that wrap around
+    (Prev from Red goes to Purple, Next from Purple goes to Red). Each
+    card is a real image (not a squished text line) with a numbered toggle
+    button below it. Selection state lives on the BUTTONS (green = picked,
+    grey = not), never baked into the image -- that way toggling is a
+    component-only edit with no re-render or re-upload, which is what keeps
+    it feeling instant. Picks persist across category switches (tracked as
+    a plain set of card ids).
     """
 
     def __init__(self, cog: "Duel", draft_id: str, user_id: int,
@@ -362,44 +336,42 @@ class DeckBuilderView(discord.ui.View):
         self.category_index = category_index
 
         color = CATEGORIES[self.category_index]
-        cards_here = cog.cards_by_color[color]
-        self.current_category_ids = {c.id for c in cards_here}
+        self.cards_here = cog.cards_by_color[color]
 
-        select = discord.ui.Select(
-            custom_id=f"deck_select_{color}",
-            placeholder=f"{CATEGORY_EMOJI[color]} {color} cards",
-            min_values=0,
-            max_values=len(cards_here),
-            options=[
-                discord.SelectOption(
-                    label=c.name,
-                    description=f"{describe_active_compact(c)}  {describe_passive_compact(c)}",
-                    value=c.id,
-                    default=c.id in self.picked,
-                )
-                for c in cards_here
-            ],
-        )
-        select.callback = self._on_pick
-        self.add_item(select)
+        self._card_buttons: list[discord.ui.Button] = []
+        for i, card in enumerate(self.cards_here):
+            is_picked = card.id in self.picked
+            btn = discord.ui.Button(
+                label=str(i + 1),
+                style=discord.ButtonStyle.success if is_picked else discord.ButtonStyle.secondary,
+                row=i // 5,
+            )
+            btn.callback = self._make_toggle_callback(card.id)
+            self.add_item(btn)
+            self._card_buttons.append(btn)
 
-        prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary,
-                                      disabled=self.category_index == 0)
+        prev_btn = discord.ui.Button(label="◀ Prev", style=discord.ButtonStyle.secondary, row=2)
         prev_btn.callback = self._on_prev
         self.add_item(prev_btn)
 
-        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary,
-                                      disabled=self.category_index == len(CATEGORIES) - 1)
+        next_btn = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.secondary, row=2)
         next_btn.callback = self._on_next
         self.add_item(next_btn)
 
         confirm_btn = discord.ui.Button(
             label=f"Confirm Deck ({len(self.picked)}/{DECK_SIZE})",
-            style=discord.ButtonStyle.success,
+            style=discord.ButtonStyle.primary,
             disabled=len(self.picked) != DECK_SIZE,
+            row=2,
         )
         confirm_btn.callback = self._on_confirm
         self.add_item(confirm_btn)
+        self._confirm_btn = confirm_btn
+
+    async def render_file(self) -> discord.File:
+        card_ids = [c.id for c in self.cards_here]
+        png_bytes = await asyncio.to_thread(render_deck_grid_image, card_ids)
+        return discord.File(io.BytesIO(png_bytes), filename="deck_page.png")
 
     def _status_text(self) -> str:
         color = CATEGORIES[self.category_index]
@@ -408,21 +380,36 @@ class DeckBuilderView(discord.ui.View):
             status += " ⚠️ That's too many — deselect some before confirming."
         return status
 
-    async def _on_pick(self, interaction: discord.Interaction):
+    def _refresh_button_states(self) -> None:
+        """Updates this view's buttons in place to match `self.picked`, rather than
+        constructing a whole new view. Paired with editing only content+view (never
+        attachments), this keeps a toggle to a pure component update -- no image
+        re-render, no re-upload."""
+        for i, card in enumerate(self.cards_here):
+            btn = self._card_buttons[i]
+            btn.style = discord.ButtonStyle.success if card.id in self.picked else discord.ButtonStyle.secondary
+        self._confirm_btn.label = f"Confirm Deck ({len(self.picked)}/{DECK_SIZE})"
+        self._confirm_btn.disabled = len(self.picked) != DECK_SIZE
+
+    def _make_toggle_callback(self, card_id: str):
+        async def callback(interaction: discord.Interaction):
+            await self._on_toggle(interaction, card_id)
+        return callback
+
+    async def _on_toggle(self, interaction: discord.Interaction, card_id: str):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn't your deck to build.", ephemeral=True)
             return
 
-        # This select only reports ITS OWN current selection. Replace this
-        # category's slice of `picked` with what it just reported, leaving
-        # picks from other (currently hidden) categories untouched.
-        chosen_here = set(interaction.data.get("values", []))
-        self.picked -= self.current_category_ids
-        self.picked |= chosen_here
+        if card_id in self.picked:
+            self.picked.discard(card_id)
+        else:
+            self.picked.add(card_id)
 
-        new_view = DeckBuilderView(self.cog, self.draft_id, self.user_id,
-                                    picked=self.picked, category_index=self.category_index)
-        await interaction.response.edit_message(content=new_view._status_text(), view=new_view)
+        self._refresh_button_states()
+        # No `attachments=` kwarg -- Discord leaves the already-uploaded grid image
+        # in place, so this round-trips as a tiny component-only edit.
+        await interaction.response.edit_message(content=self._status_text(), view=self)
 
     async def _on_prev(self, interaction: discord.Interaction):
         await self._change_page(interaction, -1)
@@ -434,10 +421,13 @@ class DeckBuilderView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This isn't your deck to build.", ephemeral=True)
             return
-        new_index = max(0, min(len(CATEGORIES) - 1, self.category_index + delta))
+        # Wraps around: Prev from the first color lands on the last, and
+        # Next from the last lands on the first.
+        new_index = (self.category_index + delta) % len(CATEGORIES)
         new_view = DeckBuilderView(self.cog, self.draft_id, self.user_id,
                                     picked=self.picked, category_index=new_index)
-        await interaction.response.edit_message(content=new_view._status_text(), view=new_view)
+        file = await new_view.render_file()
+        await interaction.response.edit_message(content=new_view._status_text(), attachments=[file], view=new_view)
 
     async def _on_confirm(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
@@ -451,7 +441,8 @@ class DeckBuilderView(discord.ui.View):
 
         deck = [self.cog.pool_by_id[card_id] for card_id in self.picked]
         await interaction.response.edit_message(
-            content="✅ Deck locked in! Waiting for your opponent to finish building theirs...", view=None,
+            content="✅ Deck locked in! Waiting for your opponent to finish building theirs...",
+            attachments=[], view=None,
         )
         await self.cog.on_deck_confirmed(self.draft_id, self.user_id, deck)
 
@@ -767,8 +758,20 @@ class Duel(commands.Cog):
         channels_to_delete += [session.channel for session in self.drafts.values()]
 
         for channel in channels_to_delete:
-            _mark_channel_orphaned(channel.id)  # in case delete() below doesn't get to finish
+            # in case delete() below doesn't get to finish
+            _mark_channel_orphaned(channel.id, channel.guild.id if channel.guild else None)
             await _delete_channel_and_unregister(channel)
+
+    async def prewarm_render_cache(self):
+        """
+        Renders every color page once at startup so the cache is hot before anyone opens
+        the deckbuilder. Without this the first player to do so pays the full cold-render
+        cost (~0.5s per page); after this, page flips are instant for everyone. Runs off
+        the event loop so it doesn't delay the bot coming online.
+        """
+        for color in CATEGORIES:
+            card_ids = [c.id for c in self.cards_by_color[color]]
+            await asyncio.to_thread(render_deck_grid_image, card_ids)
 
     async def sweep_orphaned_channels(self):
         """
@@ -781,13 +784,26 @@ class Duel(commands.Cog):
         orphaned. A channel that fails to delete (permissions, a transient
         API error) stays tracked for the next sweep to retry, instead of
         being forgotten.
+
+        Works across every server the bot is in. Rows belonging to a guild
+        the bot has since been removed from are dropped rather than retried
+        forever -- those channels are unreachable to us, and if the bot is
+        re-invited later Discord will have cleaned them up or they'll be
+        re-registered fresh.
         """
-        orphaned_ids = _load_orphaned_channel_ids()
-        if not orphaned_ids:
+        orphaned = _load_orphaned_channels()
+        if not orphaned:
             return
 
+        known_guild_ids = {g.id for g in self.bot.guilds}
         deleted = 0
-        for channel_id in orphaned_ids:
+        skipped_foreign_guild = 0
+
+        for channel_id, guild_id in orphaned:
+            if guild_id is not None and guild_id not in known_guild_ids:
+                _unregister_channel_id(channel_id)  # bot no longer in that server -- unreachable
+                skipped_foreign_guild += 1
+                continue
             try:
                 channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
             except discord.NotFound:
@@ -799,8 +815,24 @@ class Duel(commands.Cog):
             if await _delete_channel_and_unregister(channel):
                 deleted += 1
 
-        if deleted:
-            print(f"[duel] Swept {deleted} orphaned duel channel(s) from a previous session.")
+        if deleted or skipped_foreign_guild:
+            print(
+                f"[duel] Swept {deleted} orphaned duel channel(s) from a previous session"
+                f" across {len(known_guild_ids)} server(s)"
+                + (f"; dropped {skipped_foreign_guild} from servers the bot has left." if skipped_foreign_guild else ".")
+            )
+
+    def _describe_match_location(self, match, current_guild_id: int) -> str:
+        """Returns a short ' in <server>' suffix when a player's existing match is in a
+        DIFFERENT server, or '' when it's this one. A player can only be in one duel at a
+        time across all servers, so without this the rejection reads as a mystery if their
+        match is happening somewhere else."""
+        channel = self.channels.get(match.match_id)
+        if channel is None or channel.guild is None:
+            return ""
+        if channel.guild.id == current_guild_id:
+            return ""
+        return f" in **{channel.guild.name}**"
 
     @app_commands.command(name="duel", description="Challenge another player to a card duel in a private channel.")
     async def duel(self, interaction: discord.Interaction, opponent: discord.Member):
@@ -813,11 +845,17 @@ class Duel(commands.Cog):
         if opponent.id == interaction.user.id:
             await interaction.response.send_message("You can't duel yourself.", ephemeral=True)
             return
-        if self.manager.get_match_for_user(interaction.user.id):
-            await interaction.response.send_message("You're already in a match.", ephemeral=True)
+        existing = self.manager.get_match_for_user(interaction.user.id)
+        if existing:
+            where = self._describe_match_location(existing, interaction.guild.id)
+            await interaction.response.send_message(f"You're already in a match{where}.", ephemeral=True)
             return
-        if self.manager.get_match_for_user(opponent.id):
-            await interaction.response.send_message(f"{opponent.display_name} is already in a match.", ephemeral=True)
+        existing_opponent = self.manager.get_match_for_user(opponent.id)
+        if existing_opponent:
+            where = self._describe_match_location(existing_opponent, interaction.guild.id)
+            await interaction.response.send_message(
+                f"{opponent.display_name} is already in a match{where}.", ephemeral=True,
+            )
             return
         if not interaction.guild.me.guild_permissions.manage_channels:
             await interaction.response.send_message(
@@ -830,7 +868,7 @@ class Duel(commands.Cog):
 
         category = await get_or_create_duel_category(interaction.guild)
         channel = await create_duel_channel(interaction.guild, category, interaction.user, opponent)
-        _register_channel_id(channel.id)
+        _register_channel_id(channel.id, interaction.guild.id)
 
         draft_id = str(uuid.uuid4())
         challenge_message = await channel.send(

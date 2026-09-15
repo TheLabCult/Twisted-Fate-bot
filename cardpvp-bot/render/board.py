@@ -186,6 +186,65 @@ def render_hand_image(card_ids: list[Optional[str]], usable_flags: Optional[list
     return buffer.getvalue()
 
 
+GRID_THUMB_W, GRID_THUMB_H = 150, 210  # matches the card art's ~0.714 aspect ratio
+GRID_GAP = 16
+GRID_MARGIN = 20
+GRID_BADGE_H = 36
+
+_deck_grid_cache: dict[str, bytes] = {}
+
+
+def render_deck_grid_image(card_ids: list[str], columns: int = 5) -> bytes:
+    """
+    Renders a grid of card-art thumbnails (5 per row by default, so a 10-card color page
+    is a clean 5x2 grid) with numbered badges matching the toggle buttons Discord-side.
+
+    Deliberately does NOT bake in which cards are picked. Selection state lives entirely
+    on the buttons (green vs grey), which Discord recolors instantly with no file
+    transfer -- baking it into the image instead would mean re-rendering and re-uploading
+    ~240KB on every single click, which is exactly what made the deckbuilder feel slow.
+    Because the result depends only on the card list, it's cached: each color page is
+    rendered at most once per process.
+    """
+    cache_key = ",".join(card_ids)
+    cached = _deck_grid_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    n = len(card_ids)
+    rows = max(1, (n + columns - 1) // columns)
+    row_h = GRID_BADGE_H + GRID_THUMB_H
+
+    width = GRID_MARGIN * 2 + columns * GRID_THUMB_W + (columns - 1) * GRID_GAP
+    height = GRID_MARGIN * 2 + rows * row_h + (rows - 1) * GRID_GAP
+
+    img = Image.new("RGB", (width, height), (30, 32, 40))
+    draw = ImageDraw.Draw(img)
+
+    for i, card_id in enumerate(card_ids):
+        col, row = i % columns, i // columns
+        x = GRID_MARGIN + col * (GRID_THUMB_W + GRID_GAP)
+        badge_top = GRID_MARGIN + row * (row_h + GRID_GAP)
+        y = badge_top + GRID_BADGE_H
+
+        thumb = _load_card_image(card_id).resize((GRID_THUMB_W, GRID_THUMB_H))
+        img.paste(thumb, (x, y))
+        draw.rectangle([x, y, x + GRID_THUMB_W, y + GRID_THUMB_H], outline=(255, 255, 255), width=2)
+
+        badge_r = 16
+        bx, by = x + GRID_THUMB_W / 2, badge_top + GRID_BADGE_H / 2
+        draw.ellipse([bx - badge_r, by - badge_r, bx + badge_r, by + badge_r],
+                     fill=(90, 160, 235), outline=(255, 255, 255), width=2)
+        _centered(draw, bx, by - 10, str(i + 1), _font(16), (255, 255, 255))
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    data = buffer.getvalue()
+    _deck_grid_cache[cache_key] = data
+    return data
+
+
 @dataclass
 class PlayerRenderState:
     name: str

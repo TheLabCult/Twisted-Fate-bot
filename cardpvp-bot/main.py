@@ -50,6 +50,10 @@ class CardPvPBot(commands.Bot):
             duel_cog = self.get_cog("Duel")
             if duel_cog:
                 await duel_cog.sweep_orphaned_channels()
+                # Background task: warms the deckbuilder image cache so the first
+                # player to open it doesn't pay the cold-render cost. Not awaited,
+                # since nothing needs to block on it.
+                asyncio.create_task(duel_cog.prewarm_render_cache())
 
     async def close(self):
         # Run this BEFORE super().close() disconnects -- channel.delete()
