@@ -245,6 +245,53 @@ def render_deck_grid_image(card_ids: list[str], columns: int = 5) -> bytes:
     return data
 
 
+DECK_REVEAL_HEADER_H = 40
+
+
+def render_decks_reveal_image(player_decks: list[tuple[str, list[str]]], columns: int = 5) -> bytes:
+    """
+    Renders each player's full built deck as a labeled grid of card art, stacked
+    vertically -- shown after a match ends, since hands stay private for the whole
+    game and this is the first point where "what deck did they actually build"
+    becomes fair to reveal. `player_decks` is a list of (display_name, card_ids).
+    Not cached like render_deck_grid_image: every match's deck composition is
+    different (and each player picks their own 10 from 50), so there's nothing
+    to reuse between calls.
+    """
+    if not player_decks:
+        player_decks = [("", [])]
+
+    max_len = max((len(ids) for _, ids in player_decks), default=1)
+    rows = max(1, (max_len + columns - 1) // columns)
+    grid_w = GRID_MARGIN * 2 + columns * GRID_THUMB_W + (columns - 1) * GRID_GAP
+    section_h = DECK_REVEAL_HEADER_H + rows * GRID_THUMB_H + (rows - 1) * GRID_GAP + GRID_MARGIN
+    total_h = GRID_MARGIN + len(player_decks) * section_h
+
+    img = Image.new("RGB", (grid_w, total_h), (24, 26, 32))
+    draw = ImageDraw.Draw(img)
+
+    name_font = _font(22)
+    y = GRID_MARGIN
+    for name, card_ids in player_decks:
+        _centered(draw, grid_w / 2, y, f"{name}'s Deck", name_font, (255, 255, 255))
+        grid_top = y + DECK_REVEAL_HEADER_H
+
+        for i, card_id in enumerate(card_ids):
+            col, row = i % columns, i // columns
+            x = GRID_MARGIN + col * (GRID_THUMB_W + GRID_GAP)
+            cy = grid_top + row * (GRID_THUMB_H + GRID_GAP)
+            thumb = _load_card_image(card_id).resize((GRID_THUMB_W, GRID_THUMB_H))
+            img.paste(thumb, (x, cy))
+            draw.rectangle([x, cy, x + GRID_THUMB_W, cy + GRID_THUMB_H], outline=(255, 255, 255), width=2)
+
+        y += section_h
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 @dataclass
 class PlayerRenderState:
     name: str

@@ -36,7 +36,8 @@ from discord.ext import commands
 from game.cards import load_card_pool
 from game.engine import DECK_SIZE, MAX_MANA, STARTING_HP, Card, MatchManager, passive_has_effect
 from render.board import (
-    BattleRenderState, PlayerRenderState, render_battle_image, render_deck_grid_image, render_hand_image,
+    BattleRenderState, PlayerRenderState, render_battle_image, render_deck_grid_image,
+    render_decks_reveal_image, render_hand_image,
 )
 
 CHALLENGE_TIMEOUT_SECONDS = 120
@@ -82,7 +83,32 @@ def _get_db() -> sqlite3.Connection:
     existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(duel_channels)")}
     if "guild_id" not in existing_columns:
         conn.execute("ALTER TABLE duel_channels ADD COLUMN guild_id INTEGER")
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS favorite_deck_cards ("
+        "  user_id INTEGER NOT NULL,"
+        "  card_id TEXT NOT NULL,"
+        "  PRIMARY KEY (user_id, card_id)"
+        ")"
+    )
     return conn
+
+
+def _save_favorite_deck(user_id: int, card_ids: list[str]) -> None:
+    with _get_db() as conn:
+        conn.execute("DELETE FROM favorite_deck_cards WHERE user_id = ?", (user_id,))
+        conn.executemany(
+            "INSERT INTO favorite_deck_cards (user_id, card_id) VALUES (?, ?)",
+            [(user_id, cid) for cid in card_ids],
+        )
+
+
+def _load_favorite_deck(user_id: int) -> list[str]:
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT card_id FROM favorite_deck_cards WHERE user_id = ?", (user_id,)
+        ).fetchall()
+    return [row[0] for row in rows]
 
 
 def _register_channel_id(channel_id: int, guild_id: int) -> None:
@@ -242,6 +268,24 @@ async def render_board_file(match, members: dict[int, discord.Member], avatar_ca
     return discord.File(io.BytesIO(png_bytes), filename="battle.png")
 
 
+async def render_decks_file(match, members: dict[int, discord.Member]) -> discord.File:
+    """
+    Builds a discord.File revealing both players' full built decks -- meant for the
+    game-over message, since hands stay private for the whole match. A player's complete
+    10-card deck is always exactly deck+hand+discard combined: cards only ever move
+    between those three piles over the course of a match, never leave the game, so no
+    separate "original deck" bookkeeping is needed to reconstruct it after the fact.
+    """
+    player_decks = []
+    for uid, player in match.players.items():
+        all_cards = player.deck + player.hand + player.discard
+        card_ids = [c.template_id or c.id for c in all_cards]
+        player_decks.append((members[uid].display_name, card_ids))
+
+    png_bytes = await asyncio.to_thread(render_decks_reveal_image, player_decks)
+    return discord.File(io.BytesIO(png_bytes), filename="decks_reveal.png")
+
+
 # ---------------------------------------------------------------------------
 # Deckbuilding
 # ---------------------------------------------------------------------------
@@ -323,7 +367,9 @@ class DeckBuilderView(discord.ui.View):
     grey = not), never baked into the image -- that way toggling is a
     component-only edit with no re-render or re-upload, which is what keeps
     it feeling instant. Picks persist across category switches (tracked as
-    a plain set of card ids).
+    a plain set of card ids). If the player has a saved favorite deck (see
+    SaveFavoritePromptView), a "Use Favorite" button loads all 10 of its
+    cards in one click, overwriting the current selection.
     """
 
     def __init__(self, cog: "Duel", draft_id: str, user_id: int,
@@ -368,6 +414,16 @@ class DeckBuilderView(discord.ui.View):
         self.add_item(confirm_btn)
         self._confirm_btn = confirm_btn
 
+        favorite_ids = _load_favorite_deck(user_id)
+        self.valid_favorite = (
+            favorite_ids if len(favorite_ids) == DECK_SIZE and all(cid in cog.pool_by_id for cid in favorite_ids)
+            else None
+        )
+        if self.valid_favorite:
+            favorite_btn = discord.ui.Button(label="🌟 Use Favorite", style=discord.ButtonStyle.secondary, row=2)
+            favorite_btn.callback = self._on_use_favorite
+            self.add_item(favorite_btn)
+
     async def render_file(self) -> discord.File:
         card_ids = [c.id for c in self.cards_here]
         png_bytes = await asyncio.to_thread(render_deck_grid_image, card_ids)
@@ -411,6 +467,19 @@ class DeckBuilderView(discord.ui.View):
         # in place, so this round-trips as a tiny component-only edit.
         await interaction.response.edit_message(content=self._status_text(), view=self)
 
+    async def _on_use_favorite(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your deck to build.", ephemeral=True)
+            return
+        if not self.valid_favorite:
+            await interaction.response.send_message("You don't have a saved favorite deck.", ephemeral=True)
+            return
+
+        # Full overwrite, not additive -- "instantly choose" means exactly that.
+        self.picked = set(self.valid_favorite)
+        self._refresh_button_states()
+        await interaction.response.edit_message(content=self._status_text(), view=self)
+
     async def _on_prev(self, interaction: discord.Interaction):
         await self._change_page(interaction, -1)
 
@@ -439,12 +508,48 @@ class DeckBuilderView(discord.ui.View):
             )
             return
 
-        deck = [self.cog.pool_by_id[card_id] for card_id in self.picked]
+        deck_ids = list(self.picked)
+        deck = [self.cog.pool_by_id[card_id] for card_id in deck_ids]
         await interaction.response.edit_message(
             content="✅ Deck locked in! Waiting for your opponent to finish building theirs...",
             attachments=[], view=None,
         )
+        # Offered as a separate followup so it never blocks or delays the match starting.
+        already_saved = sorted(deck_ids) == sorted(_load_favorite_deck(self.user_id))
+        if not already_saved:
+            await interaction.followup.send(
+                "⭐ Save this deck as your favorite? You'll be able to load it instantly next time.",
+                view=SaveFavoritePromptView(self.user_id, deck_ids), ephemeral=True,
+            )
         await self.cog.on_deck_confirmed(self.draft_id, self.user_id, deck)
+
+
+class SaveFavoritePromptView(discord.ui.View):
+    """Ephemeral follow-up offered right after confirming a deck."""
+
+    def __init__(self, user_id: int, card_ids: list[str]):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.card_ids = card_ids
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your prompt.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="⭐ Save as Favorite", style=discord.ButtonStyle.success)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _save_favorite_deck(self.user_id, self.card_ids)
+        await interaction.response.edit_message(
+            content="⭐ Saved! Use **Use Favorite** next time you build a deck to load it instantly.", view=None,
+        )
+        self.stop()
+
+    @discord.ui.button(label="No thanks", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="No problem — not saved.", view=None)
+        self.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -616,9 +721,12 @@ async def refresh_public_message(interaction: discord.Interaction, match, manage
     if result.game_over:
         winner_name = members[result.winner_id].display_name
         file = await render_board_file(match, members, avatar_cache, winner_name=winner_name)
+        decks_file = await render_decks_file(match, members)
         manager.end_match(match.match_id)
         messages.pop(match.match_id, None)
-        await interaction.response.edit_message(content=result.message, embed=None, attachments=[file], view=None)
+        await interaction.response.edit_message(
+            content=result.message, embed=None, attachments=[file, decks_file], view=None,
+        )
         channel = channels.pop(match.match_id, None)
         if channel:
             await interaction.followup.send("This channel will be deleted in 10 minutes. GG!")
@@ -639,9 +747,10 @@ async def update_public_message(match, manager, members, messages, channels, ava
     if result.game_over:
         winner_name = members[result.winner_id].display_name
         file = await render_board_file(match, members, avatar_cache, winner_name=winner_name)
+        decks_file = await render_decks_file(match, members)
         manager.end_match(match.match_id)
         messages.pop(match.match_id, None)
-        await public_message.edit(content=result.message, embed=None, attachments=[file], view=None)
+        await public_message.edit(content=result.message, embed=None, attachments=[file, decks_file], view=None)
         channel = channels.pop(match.match_id, None)
         if channel:
             await channel.send("This channel will be deleted in 10 minutes. GG!")
